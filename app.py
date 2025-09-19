@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-<<<<<<< HEAD
 CareMind · MVP CDSS · 前端 (Streamlit)
 依赖：
   - streamlit>=1.32
@@ -15,18 +14,17 @@ CareMind · MVP CDSS · 前端 (Streamlit)
     ],
     "drug": {"药品名称": "...", "适应症": "...", ...}  # 若有，则为结构化信息
   }
-=======
 CareMind · MVP CDSS · Bilingual Frontend (Streamlit)： 
 -  Clinical Decision Support System (CDSS) - Minimal Viable Product (MVP)
 Language switch: 中文 / English (sidebar)
 Backend API: from rag.pipeline import answer(question, drug_name=None, k:int) -> dict
->>>>>>> 97d42f6 (Restructure for Streamlit Cloud: package imports, ingest tools, config, requirements)
+
 """
 
 from __future__ import annotations
 
 import json
-<<<<<<< HEAD
+
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
@@ -80,7 +78,7 @@ st.markdown(
         font-size:16px;
     }
     footer {visibility: hidden;}
-=======
+
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -219,7 +217,6 @@ st.markdown(
 )
 
 # ---------------------------
-<<<<<<< HEAD
 # Sidebar：检索与显示设置
 # ---------------------------
 with st.sidebar:
@@ -338,7 +335,7 @@ with col_right:
                 doc_id = str(meta.get("id") or "")
 
                 label = f"#{i} · {title}" if title else f"#{i} · 无标题片段"
-=======
+
 # 辅助函数
 # ---------------------------
 def t(lang: str, key: str) -> str:
@@ -528,12 +525,10 @@ if res:
                 doc_id = str(m.get("id") or "—")
                 label = f"#{i} · {title[:60]}"
                 st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
->>>>>>> 97d42f6 (Restructure for Streamlit Cloud: package imports, ingest tools, config, requirements)
                 with st.expander(label, expanded=expand_hits):
                     if show_meta:
                         st.markdown(
                             f"<div class='cm-muted'>"
-<<<<<<< HEAD
                             f"<span class='cm-badge'>来源：{source or '未知'}</span>"
                             f"<span class='cm-badge'>年份：{year or '—'}</span>"
                             f"<span class='cm-badge'>ID：{doc_id or '—'}</span>"
@@ -567,7 +562,6 @@ with st.expander("🗂️ 本会话历史（仅本地会话内可见）", expand
 # 页脚提示
 # ---------------------------
 st.caption("© CareMind · MVP CDSS | 本工具仅供临床决策参考，不替代医师诊断与处方。")
-=======
                             f"<span class='cm-badge'>{t(lang, 'chips_src')} {source}</span>"
                             f"<span class='cm-badge'>{t(lang, 'chips_year')} {year}</span>"
                             f"<span class='cm-badge'>{t(lang, 'chips_id')} {doc_id}</span>"
@@ -629,4 +623,3 @@ if "reseed" in st.session_state:
 
 # Footer
 st.caption(t(lang, "page_footer"))
->>>>>>> 97d42f6 (Restructure for Streamlit Cloud: package imports, ingest tools, config, requirements)
