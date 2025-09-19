@@ -213,7 +213,6 @@ st.markdown(
     .cm-muted{color:#64748b;font-size:13px;}
     .cm-output{line-height:1.75;font-size:17px;}
     footer{visibility:hidden;}
->>>>>>> 97d42f6 (Restructure for Streamlit Cloud: package imports, ingest tools, config, requirements)
     </style>
     """,
     unsafe_allow_html=True,
