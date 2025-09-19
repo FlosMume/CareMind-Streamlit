@@ -7,3 +7,4 @@ torch
 pydantic>=2
 scikit-learn
 sqlite-utils
+pysqlite3-binary==0.5.3
