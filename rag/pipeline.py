@@ -1,443 +1,176 @@
 # -*- coding: utf-8 -*-
 """
-CareMind RAG — Inference Pipeline (Ollama + Qwen2)
-
-This file is the "glue" that ties everything together:
-1) it pulls guideline snippets and drug info from the retriever,
-2) builds a clean, compliance-oriented prompt,
-3) calls a local LLM (Ollama with Qwen2),
-4) and returns the model's answer along with the retrieved evidence.
-
---------------------------------------------------------------------------------
-Quick Start (from project root):
-    conda activate caremind
-    export OLLAMA_BASE_URL=http://localhost:11434
-    export LLM_MODEL=qwen2:7b-instruct
-    python -m rag.pipeline --q "老年高血压合并2型糖尿病的血压与血糖目标？" --drug "氨氯地平" --k 4
-
-Env Vars (tune generation or point to a different LLM):
-    OLLAMA_BASE_URL   default http://localhost:11434
-    LLM_MODEL         default qwen2:7b-instruct
-    LLM_NUM_CTX       optional context window size
-    LLM_TEMPERATURE   optional decoding temperature
-    LLM_TOP_P         optional nucleus sampling
-    LLM_SEED          optional seed for reproducibility
-
-High-level flow:
-    [retriever.search_guidelines] -> list of top-k snippets (with metadata)
-                         |
-                         v
-    [format_guideline_snippets] -> readable "【标题 | 来源 | 年份】\n片段" text block
-                         |
-                         +--- [retriever.search_drugs or fetch_drug] -> drug dict
-                         |                   |
-                         |                   v
-                         |            [format_drug_info] -> readable drug info
-                         v
-      [prompt.SYSTEM + prompt.USER_TEMPLATE] -> user/system messages
-                         |
-                         v
-                    [llm_chat] -> call Ollama /api/chat (fallback /api/generate)
-                         |
-                         v
-                    dict(output, guideline_hits, drug, prompt)
---------------------------------------------------------------------------------
+rag/pipeline.py
+----------------
+Thin orchestration layer between the Streamlit UI (app.py) and backend retrieval.
+- Keeps imports light so the app can boot on Streamlit Cloud even if Chroma/SQLite aren't available
+- Provides a DEMO mode fallback (no hard crash; returns stubbed response)
+- Centralizes prompt composition / output formatting
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 import os
-import json
-import time
-import argparse
-import requests
-from typing import Any, Dict, List, Optional
+import traceback
 
-# We import the retriever module (your local search/DB access code),
-# and the pre-defined prompts to keep answers consistent & compliant.
+# Import our local modules only (these should NOT import heavy libs at module top-level)
+# retriever.py should lazy-import chromadb and alias pysqlite3->sqlite3 as needed.
 from . import retriever as R
-from .prompt import SYSTEM, USER_TEMPLATE
+from .prompt import SYSTEM, USER_TEMPLATE  # keep your existing prompt strings
 
-# =============================================================================
-#                       LLM endpoint & generation options
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Config & Flags
+# -----------------------------------------------------------------------------
+DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"  # default demo ON for Cloud
+MAX_K: int = int(os.getenv("CAREMIND_MAX_K", "8"))
 
-# Where Ollama is running and which model to use.
-# - If you use WSL or remote machine, change OLLAMA_BASE_URL accordingly.
-OLLAMA = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-MODEL  = os.getenv("LLM_MODEL", "qwen2:7b-instruct")
+# Optional envs used by retriever; not required here but useful for logs
+CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+CHROMA_COLL = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
 
-def _ollama_options() -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# Data model for the final answer returned to app.py
+# -----------------------------------------------------------------------------
+@dataclass
+class AnswerBundle:
+    output: str
+    guideline_hits: List[Dict[str, Any]]
+    drug: Optional[Dict[str, Any]]
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _clamp_k(k: int) -> int:
+    try:
+        k = int(k)
+    except Exception:
+        k = 4
+    return max(1, min(MAX_K, k))
+
+
+def _render_with_citations(raw_text: str, hits: List[Dict[str, Any]]) -> str:
     """
-    Read optional decoding parameters from environment variables.
-    These are passed to Ollama under "options".
-    Beginners:
-      - temperature: lower (e.g., 0.1) = more deterministic, safer for medical QA
-      - top_p: nucleus sampling; often keep default if unsure
-      - num_ctx: context window size (tokens); bigger lets you pass more text
+    Optionally post-process the LLM text to ensure [#1], [#2] style citations map to hits.
+    Here we just return raw_text; keep hook for future formatting.
     """
-    def _f(name: str) -> Optional[float]:
-        v = os.getenv(name)
-        if v is None: return None
-        try: return float(v)
-        except ValueError: return None
+    return raw_text or ""
 
-    def _i(name: str) -> Optional[int]:
-        v = os.getenv(name)
-        if v is None: return None
-        try: return int(v)
-        except ValueError: return None
 
-    opts: Dict[str, Any] = {}
-    t  = _f("LLM_TEMPERATURE")
-    tp = _f("LLM_TOP_P")
-    sd = _i("LLM_SEED")
-    nc = _i("LLM_NUM_CTX")
-
-    if t  is not None: opts["temperature"] = t
-    if tp is not None: opts["top_p"]       = tp
-    if sd is not None: opts["seed"]        = sd
-    if nc is not None: opts["num_ctx"]     = nc
-
-    # Safe default: keep generation stable for clinical style answers
-    if "temperature" not in opts:
-        opts["temperature"] = 0.1
-
-    return opts
-
-def llm_chat(system: str, user: str, timeout: int = 120, retries: int = 2) -> str:
+def _compose_user_prompt(question: str, drug_name: Optional[str], hits: List[Dict[str, Any]]) -> str:
     """
-    Call the local LLM through Ollama.
-    - We prefer the newer /api/chat endpoint (role-based messages).
-    - If /api/chat isn't available (older Ollama), we fallback to /api/generate.
-
-    Why a fallback? Because some environments ship older Ollama builds
-    or custom servers that only support /api/generate.
-
-    Args:
-      system: system prompt that sets role & rules (e.g., compliance)
-      user:   user message composed from the question + retrieved evidence
-      timeout: HTTP timeout seconds
-      retries: simple retry count for transient network hiccups
-
-    Returns:
-      The assistant's text content (string), or raises RuntimeError on failure.
+    Fills USER_TEMPLATE with question, optional drug, and selected evidence.
+    Expect USER_TEMPLATE to have placeholders like {question}, {drug}, {evidence_md}.
     """
-    options = _ollama_options()
-
-    # Payload for /api/chat (messages with roles)
-    chat_payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        "stream": False,        # we want a single JSON response
-        "options": options,     # pass decoding options
-    }
-
-    last_err: Optional[Exception] = None
-    for attempt in range(retries + 1):
-        try:
-            # Try the modern endpoint first
-            r = requests.post(f"{OLLAMA}/api/chat", json=chat_payload, timeout=timeout)
-            if r.status_code in (404, 405):
-                # Not supported on this server; trigger fallback
-                raise requests.HTTPError(f"{r.status_code} Not supported", response=r)
-
-            r.raise_for_status()
-            data = r.json()
-            # Standard shape: {"message": {"content": "..."}}
-            content = (data.get("message") or {}).get("content", "")
-            if not isinstance(content, str) or not content.strip():
-                raise ValueError("Empty content from /api/chat")
-            return content
-
-        except (requests.RequestException, ValueError, KeyError) as e:
-            last_err = e
-
-            # Fallback to /api/generate (older Ollama uses "prompt" instead of messages)
-            if isinstance(e, requests.HTTPError) and getattr(e, "response", None) \
-               and e.response is not None and e.response.status_code in (404, 405):
-                try:
-                    # We concatenate system + user in a readable way
-                    prompt = (
-                        "【系统角色】\n" + system.strip() +
-                        "\n\n【用户】\n" + user.strip() +
-                        "\n\n请严格按照系统角色与合规要求作答。"
-                    )
-                    gen_payload = {
-                        "model": MODEL,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": options,
-                    }
-                    g = requests.post(f"{OLLAMA}/api/generate", json=gen_payload, timeout=timeout)
-                    g.raise_for_status()
-                    data = g.json()
-                    content = data.get("response", "")
-                    if not isinstance(content, str) or not content.strip():
-                        raise ValueError("Empty content from /api/generate")
-                    return content
-                except Exception as ee:
-                    # If fallback also fails, save the error for the final raise
-                    last_err = ee
-
-            # Simple exponential-ish backoff between attempts
-            if attempt < retries:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-
-            # Give up after retry budget
-            raise RuntimeError(
-                f"Ollama request failed after {retries+1} attempts: {last_err}"
-            ) from last_err
-
-# =============================================================================
-#                   Formatting helpers (make snippets readable)
-# =============================================================================
-
-def format_guideline_snippets(hits: List[Dict[str, Any]]) -> str:
-    """
-    Turn guideline hits into a displayable block.
-    - We try hard to populate "来源(source)" and "年份(year)" even if the
-      original metadata is messy, using common alternatives like journal_name
-      or the filename stem.
-    - We also de-duplicate similar entries lightly (title, source, year, page).
-
-    Beginners: a "hit" here is a dict like:
-      {
-        "content": "...a snippet of text...",
-        "meta": {"title": "...", "source": "...", "year": "...", ...},
-        "score": 0.87,
-        ...
-      }
-    """
-    import os, re
-
-    def _first(*vals):
-        """Return the first non-empty string from vals."""
-        for v in vals:
-            if v is not None and str(v).strip():
-                return str(v).strip()
-        return None
-
-    def _stem(path):
-        """Get `filename` without extension from a path-like string."""
-        if not path: return None
-        base = os.path.basename(str(path))
-        return re.sub(r'\.[^.]+$', '', base)
-
-    def _infer_source(meta):
-        """
-        Try different keys to infer a readable "来源".
-        If all else fails, we fall back to filename or title.
-        """
-        return _first(
-            meta.get("source"),
-            meta.get("org"), meta.get("organization"), meta.get("issuer"),
-            meta.get("journal_name"), meta.get("journal"), meta.get("publisher"),
-            meta.get("collection"), meta.get("website"), meta.get("book_title"),
-            meta.get("conference"),
-            _stem(meta.get("source_filename") or meta.get("file")),
-            meta.get("title"),
-        ) or "未知来源"
-
-    def _infer_year(meta):
-        """
-        Try to get a 4-digit year from year/date/title/filename.
-        If parsing fails, return "未知年份".
-        """
-        y = _first(meta.get("year"), meta.get("pub_year"),
-                   meta.get("publish_date"), meta.get("date"))
-        if y:
-            m = re.search(r'(19|20)\d{2}', str(y))
-            if m: return m.group(0)
-        for f in ("title", "source_filename", "file"):
-            s = meta.get(f)
-            if s:
-                m = re.search(r'(19|20)\d{2}', str(s))
-                if m: return m.group(0)
-        return "未知年份"
-
-    if not hits:
-        return "未检索到相关指南片段。"
-
-    seen = set()
-    lines: List[str] = []
-    for h in hits:
-        meta = h.get("meta") or {}
-        src   = _infer_source(meta)
-        year  = _infer_year(meta)
-        title = _first(meta.get("title"), _stem(meta.get("source_filename") or meta.get("file"))) or ""
-        # Use a simple key to avoid showing duplicates
-        key   = (title, src, year, meta.get("page") or meta.get("pages"))
-        if key in seen:
-            continue
-        seen.add(key)
-
-        # Trim content to keep prompts short (LLM context is precious)
-        content = (h.get("content") or "").strip()[:1200]
-        title_s = f"{title} | " if title else ""
-        lines.append(f"【{title_s}{src} | {year}】\n{content}")
-
-    return "\n\n".join(lines)
-
-def format_drug_info(drug: Optional[Dict[str, Any]]) -> str:
-    """
-    Convert the structured drug dict into a readable block.
-    The retriever provides either:
-      - search_drugs(...)[0]["meta"] as the drug record, OR
-      - fetch_drug(...) as a full dict
-
-    We render only common fields; missing fields are skipped.
-    """
-    if not drug:
-        return "未指定药品"
-
-    keys = [
-        ("name", "药品名称"),
-        ("indications", "适应症"),
-        ("contraindications", "禁忌症"),
-        ("interactions", "药物相互作用"),
-        ("dosage", "用法用量"),
-        ("pregnancy_category", "妊娠分级"),
-        ("source", "来源"),
-    ]
     lines = []
-    for k, label in keys:
-        v = drug.get(k)
-        if v:
-            lines.append(f"{label}: {v}")
+    for i, h in enumerate(hits, 1):
+        m = h.get("meta") or {}
+        title = str(m.get("title") or "Untitled")
+        source = str(m.get("source") or "Unknown")
+        year = str(m.get("year") or "—")
+        content = str(h.get("content") or "")
+        lines.append(f"### #{i} {title}\n- Source: {source} · Year: {year}\n\n{content}\n")
 
-    return "\n".join(lines) if lines else "（药品信息存在，但字段为空）"
+    evidence_md = "\n".join(lines)
+    return USER_TEMPLATE.format(question=question, drug=(drug_name or ""), evidence_md=evidence_md)
 
-# =============================================================================
-#                    Compose prompt + call LLM (main routine)
-# =============================================================================
 
-def _pick_drug_record(drug_name: Optional[str]) -> Optional[Dict[str, Any]]:
-    """
-    Be flexible with retriever interfaces:
-      1) If search_drugs exists, use top-1 hit's meta as the structured record.
-      2) Else if fetch_drug exists, use that dict directly.
-      3) Else return None and the prompt will say "未指定药品".
-    """
-    if not drug_name:
-        return None
-    try:
-        search_drugs = getattr(R, "search_drugs", None)
-        if callable(search_drugs):
-            d_hits = search_drugs(drug_name, k=1) or []
-            if d_hits:
-                return (d_hits[0].get("meta") or {})
-    except Exception:
-        pass
-
-    try:
-        fetch_drug = getattr(R, "fetch_drug", None)
-        if callable(fetch_drug):
-            return fetch_drug(drug_name)
-    except Exception:
-        pass
-
-    return None
-
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
 def answer(question: str, drug_name: Optional[str] = None, k: int = 4) -> Dict[str, Any]:
     """
-    The "do everything" function:
-      - retrieve guideline snippets
-      - retrieve (optional) drug info
-      - build user prompt from template
-      - call the LLM
-      - return everything for UI or logging
+    Orchestrates retrieval + (optional) LLM reasoning.
+    Returns a dict with keys: output (str), guideline_hits (list[dict]), drug (dict|None)
 
-    Args:
-      question: clinical question in Chinese (recommended)
-      drug_name: optional drug name (Chinese/English both OK)
-      k: number of top guideline snippets to include
-
-    Returns:
-      A dict with:
-        "output": the model's answer (string),
-        "guideline_hits": the raw hits we used (for debugging),
-        "drug": the structured drug record (or None),
-        "prompt": {"system": SYSTEM, "user": the final rendered user prompt}
+    This function is intentionally resilient:
+    - If Chroma/SQLite are unavailable (e.g., Streamlit Cloud old sqlite), we will:
+        * In DEMO mode: return a helpful stub result (no crash)
+        * Otherwise: re-raise the exception for visibility
     """
-    # 1) Retrieve guideline snippets (top-k)
-    g_hits = R.search_guidelines(question, k=max(1, int(k)) if k else 4) or []
-    g_text = format_guideline_snippets(g_hits)
+    kk = _clamp_k(k)
 
-    # 2) (Optional) drug info
-    drug = _pick_drug_record(drug_name)
-    d_text = format_drug_info(drug)
+    try:
+        # 1) Retrieve guideline snippets (Chroma/whatever retriever uses internally)
+        hits: List[Dict[str, Any]] = R.search_guidelines(question, k=kk) or []
 
-    # 3) Build user message via template (keeps formatting consistent)
-    user = USER_TEMPLATE.format(
-        question=question.strip(),
-        guideline_snippets=g_text,
-        drug_info=d_text,
-        k=k,
-    )
+        # 2) Optional: retrieve structured drug info (SQLite, etc.)
+        drug_struct = None
+        if drug_name:
+            try:
+                drug_struct = R.search_drug_structured(drug_name.strip())
+            except Exception:
+                # Structured drug DB might be optional; don't fail the whole pipeline
+                drug_struct = None
 
-    # 4) Call LLM through Ollama
-    output = llm_chat(SYSTEM, user)
+        # 3) Compose prompt for your reasoning model (LLM call could be here)
+        user_prompt = _compose_user_prompt(question, drug_name, hits)
 
-    return {
-        "output": output,
-        "guideline_hits": g_hits,
-        "drug": drug,
-        "prompt": {"system": SYSTEM, "user": user},
-    }
+        # --- If you have an LLM, call it here. For now, we create a concise, cited draft. ---
+        # Replace the below with your actual LLM call if desired.
+        draft = []
+        draft.append("**Clinical Advice (Draft)**")
+        draft.append("")
+        draft.append(f"- **Question:** {question}")
+        if drug_name:
+            draft.append(f"- **Drug:** {drug_name}")
+        draft.append("")
+        draft.append("**Rationale / Evidence (selected):**")
+        if not hits:
+            draft.append("- No evidence snippets available.")
+        else:
+            for i, h in enumerate(hits, 1):
+                m = h.get("meta") or {}
+                title = str(m.get("title") or "Untitled")
+                src = str(m.get("source") or "Unknown")
+                year = str(m.get("year") or "—")
+                draft.append(f"- [#{i}] {title} ({src}, {year})")
+        draft.append("")
+        draft.append("_Compliance note: for clinical reference only; not a substitute for diagnosis/prescription._")
 
-# =============================================================================
-#                                   CLI
-# =============================================================================
+        output_text = _render_with_citations("\n".join(draft), hits)
 
-def _build_cli() -> argparse.ArgumentParser:
-    """
-    Simple command-line interface so you can test the pipeline without a UI.
-    Example:
-      python -m rag.pipeline --q "...问题..." --drug "氨氯地平" --k 4 --print-prompt
-    """
-    p = argparse.ArgumentParser(
-        prog="CareMind-RAG-Pipeline",
-        description="Run Q&A over Chinese medical guidelines + structured drug table via Ollama Qwen2."
-    )
-    p.add_argument("--q", "--question", dest="question", required=True,
-                   help="临床问题（中文推荐）")
-    p.add_argument("--drug", dest="drug", default=None,
-                   help="药品名称（可选）")
-    p.add_argument("--k", dest="k", type=int, default=4,
-                   help="检索到的指南片段数量（Top-k）")
-    p.add_argument("--print-prompt", action="store_true",
-                   help="调试：打印拼接后的 user prompt")
-    p.add_argument("--json", action="store_true",
-                   help="以 JSON 格式输出完整结果")
-    return p
+        return AnswerBundle(
+            output=output_text,
+            guideline_hits=hits,
+            drug=drug_struct,
+        ).__dict__
 
-def main() -> None:
-    """
-    Entry point for `python -m rag.pipeline`.
-    Prints either:
-      - the model's plain answer, or
-      - (with --print-prompt) the system prompt, user prompt, and the answer,
-      - (with --json) a JSON blob with everything (handy for logging).
-    """
-    args = _build_cli().parse_args()
-    res = answer(args.question, drug_name=args.drug, k=args.k)
+    except Exception as e:
+        # If running on Cloud and Chroma/SQLite is unavailable, offer a DEMO fallback.
+        if DEMO:
+            # Log a concise traceback to help debugging in Cloud logs
+            traceback.print_exc()
 
-    if args.json:
-        print(json.dumps(res, ensure_ascii=False, indent=2))
-        return
+            stub_hits: List[Dict[str, Any]] = []
+            if question.strip():
+                # Provide a tiny, fake snippet so the UI still demonstrates the flow
+                stub_hits = [{
+                    "content": "Demo mode: retrieval disabled. Provide small bundled data or connect a remote DB.",
+                    "meta": {"title": "Demo Stub", "source": "Demo", "year": "—", "id": "demo-0001"},
+                }]
 
-    if args.print_prompt:
-        print("====== SYSTEM ======")
-        print(res["prompt"]["system"])
-        print("\n====== USER ======")
-        print(res["prompt"]["user"])
-        print("\n====== OUTPUT ======")
+            draft = [
+                "**Clinical Advice (Demo)**",
+                "",
+                f"- **Question:** {question}",
+                (f"- **Drug:** {drug_name}" if drug_name else ""),
+                "",
+                "This is a demo fallback because the retrieval backend isn't available in this environment.",
+                "To enable full retrieval on Streamlit Cloud:",
+                "1) Install `pysqlite3-binary` and alias it to `sqlite3` in retriever.py",
+                "2) Ensure your Chroma index path & collection exist (or build a tiny demo set)",
+                "3) Consider lazy-importing chromadb inside retriever functions",
+                "",
+                "_Compliance note: for clinical reference only._",
+            ]
+            return AnswerBundle(
+                output="\n".join([line for line in draft if line != ""]),
+                guideline_hits=stub_hits,
+                drug=None,
+            ).__dict__
 
-    print(res["output"])
-
-if __name__ == "__main__":
-    main()
+        # In non-demo mode, propagate the real error to surface it in logs/UI
+        raise

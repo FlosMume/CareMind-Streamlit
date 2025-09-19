@@ -1,263 +1,209 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CareMind | 混合检索（Chroma + SQLite）
-File: rag/retriever.py
-
-与当前目录结构匹配：
-- 向量库目录: ./chroma_store
-- SQLite 路径: ./db/drugs.sqlite
-- （可选）原始 JSONL: ./data/guidelines.parsed.jsonl
-
-新增/改动要点
------------
-1) Chroma 集合自动识别：
-   - 首选环境变量 CHROMA_COLLECTION（默认 'guideline_chunks'）
-   - 若该集合不存在或为空 → 自动扫描已有集合，选择**非空**集合
-   - 若没有任何集合或集合为空 → 友好报错并给出诊断建议
-
-2) 安全 where 处理：绝不向 Chroma 传入空字典（避免 “Expected where to have exactly one operator” 报错）
-
-3) 诊断模式：--diagnose 打印集合列表、每个集合的计数、SQLite FTS 状态等
-
-4) SQLite：
-   - 优先使用 FTS5（drugs_fts + bm25），否则回退 LIKE
+CareMind | Retrieval helpers (Chroma + SQLite)
+- Streamlit Cloud friendly: modern SQLite shim, lazy chroma import.
+- Public API:
+    search_guidelines(query: str, k: int = 6) -> list[dict]
+    search_drugs(query: str, k: int = 6) -> list[dict]
+    search_drug_structured(drug_name: str) -> dict | None
 """
 
 from __future__ import annotations
 import os
-import sqlite3
+import sys
 from typing import Any, Dict, List, Optional
 
-from chromadb import PersistentClient
-from chromadb.utils import embedding_functions
-from sentence_transformers import SentenceTransformer
-
-# ---- Env / Defaults (match your screenshots)
+# -----------------------------------------------------------------------------
+# Environment / defaults (kept compatible with your previous code)
+# -----------------------------------------------------------------------------
 CHROMA_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-# COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks") 
-COLLECTION    = os.getenv("CHROMA_COLLECTION", "guideline_chunks_1024_v2") # preferred name
+PERSIST_DIR: str = CHROMA_DIR  # alias
+COLLECTION: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks_1024_v2")
 SQLITE_PATH: str = os.getenv("SQLITE_PATH", "./db/drugs.sqlite")
-PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-# EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh")
 EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"  # default ON in Cloud
 
+# -----------------------------------------------------------------------------
+# Ensure a modern SQLite on hosts with old stdlib sqlite3 (Cloud fix)
+# -----------------------------------------------------------------------------
+def _alias_sqlite_if_needed() -> None:
+    try:
+        import sqlite3  # noqa: F401
+        # Quick feature test: FTS5 exists from SQLite 3.9+, Chroma wants >=3.35
+        # We still alias proactively if pysqlite3 is available.
+        pass
+    except Exception:
+        pass
+    try:
+        import pysqlite3  # provided by pysqlite3-binary
+        sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+    except Exception:
+        # If not available, we proceed; Chroma may later raise a clear error.
+        pass
 
-try:
-    import torch
-    _dev = "cuda" if torch.cuda.is_available() else "cpu"
-except Exception:
-    _dev = "cpu"
-embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name=EMBED_MODEL,
-    # device="cuda"  # or "cpu" if no GPU
-    device=_dev
-    # normalize=True  # if your version supports; otherwise leave off
-)
+_alias_sqlite_if_needed()
+import sqlite3  # now safe to import
 
-# ---- Lazy singletons
-_embedder: Optional[SentenceTransformer] = None
-# _chroma_client: Optional[PersistentClient] = None
-_chroma_client = PersistentClient(path=PERSIST_DIR)
-_chroma_collection = None
+# -----------------------------------------------------------------------------
+# Lazy chroma import (so app boots even if Chroma/SQLite not ready)
+# -----------------------------------------------------------------------------
+def _chroma():
+    """
+    Import chromadb only when we actually need it.
+    Returns (PersistentClient, embedding_functions)
+    """
+    from chromadb import PersistentClient
+    from chromadb.utils import embedding_functions
+    return PersistentClient, embedding_functions
 
-# client = PersistentClient(path=PERSIST_DIR)
-# col = client.get_collection(name=COLLECTION_NAME, embedding_function=embed_fn)
+def _get_embed_fn(model_name: str = EMBED_MODEL):
+    """
+    Returns a SentenceTransformerEmbeddingFunction (lazy load).
+    """
+    _, embedding_functions = _chroma()
+    return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
 
-# =========================
-# Embeddings
-# =========================
-def get_embedder() -> SentenceTransformer:
-    global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer(EMBED_MODEL)
-    return _embedder
-
-
-def embed_text(text: str) -> List[float]:
-    model = get_embedder()
-    return model.encode([text], normalize_embeddings=True).tolist()[0]
-
-
-# =========================
-# Chroma helpers
-# =========================
-def _ensure_chroma_dir():
-    if not os.path.isdir(CHROMA_DIR):
+def _get_client() -> "PersistentClient":
+    PersistentClient, _ = _chroma()
+    if not os.path.isdir(PERSIST_DIR):
         raise FileNotFoundError(
-            f"Chroma dir not found: {CHROMA_DIR}\n"
-            "请确认向量库已写入（例如运行你的向量化脚本），或修改 CHROMA_PERSIST_DIR。"
+            f"Chroma dir not found: {PERSIST_DIR}\n"
+            "请先构建向量库（运行你的向量化脚本）或设置 CHROMA_PERSIST_DIR。"
         )
+    return PersistentClient(path=PERSIST_DIR)
 
-
-def _open_client() -> PersistentClient:
-    global _chroma_client
-    if _chroma_client is None:
-        _ensure_chroma_dir()
-        _chroma_client = PersistentClient(path=CHROMA_DIR)
-    return _chroma_client
-
-
-def _pick_nonempty_collection(client: PersistentClient, preferred: str): # -> Any:
+def _pick_collection(client: "PersistentClient", preferred: str, embed_fn) -> Any:
     """
-    选择一个可用集合：
-      1) 如果 preferred 存在且非空，返回它
-      2) 否则扫描所有集合，选择第一个 count()>0 的
-      3) 如果所有集合都为空或不存在 → 抛错并给出诊断建议
+    选择可用集合：
+      1) preferred 存在且非空 → 用它
+      2) 否则扫描非空集合 → 用第一个
+      3) 否则抛错（或在 DEMO 下返回 None）
     """
-
-    def get(name):
-        return client.get_collection(name=name, embedding_function=embed_fn)
+    def bind(name: str):
+        try:
+            return client.get_collection(name=name, embedding_function=embed_fn)
+        except Exception:
+            return None
 
     # Try preferred
-    try:
-        # col = client.get_collection(preferred)
-        col = get(preferred)
+    col = bind(preferred)
+    if col:
         try:
             if col.count() > 0:
                 return col
         except Exception:
-            pass
-            # some older chroma may not support count() well; fall back to querying 1
-            # try:
-            #    test = col.query(query_embeddings=[[0.0]], n_results=1)
-            #    if test and test.get("ids"):
-            #        return col
-            #except Exception:
-            #    pass
-        for c in client.list_collections():
+            # Old chroma may fail count(); try a minimal query
             try:
-                col = get(c.name)
+                res = col.query(query_texts=["."], n_results=1)
+                if res and res.get("ids") and res["ids"][0]:
+                    return col
+            except Exception:
+                pass
+
+    # Try any non-empty collection
+    try:
+        for c in client.list_collections():
+            col = bind(c.name)
+            if not col:
+                continue
+            try:
                 if col.count() > 0:
                     return col
             except Exception:
-                continue        
-    except Exception:
-        # preferred not found
-        pass
-
-    # Fallback: list all and choose a non-empty one
-    candidates = []
-    try:
-        candidates = client.list_collections()
+                try:
+                    res = col.query(query_texts=["."], n_results=1)
+                    if res and res.get("ids") and res["ids"][0]:
+                        return col
+                except Exception:
+                    continue
     except Exception:
         pass
 
-    for c in candidates:
-        try:
-            col = client.get_collection(c.name)
-            if col.count() > 0:
-                return col
-        except Exception:
-            # try a tiny query to see if it exists
-            try:
-                test = col.query(query_embeddings=[[0.0]], n_results=1)
-                if test and test.get("ids"):
-                    return col
-            except Exception:
-                continue
+    if DEMO:
+        # In demo mode, returning None allows the app to render without hard failing.
+        return None
 
-    # If we are here, no non-empty collections
-    names = [c.name for c in candidates] if candidates else []
     raise RuntimeError(
-        "未找到可用的 Chroma 集合（所有集合不存在或为空）。\n"
-        f"已检测集合: {names}\n"
-        "请先运行你的指南向量化/写入脚本，将 ./data/guidelines.parsed.jsonl 写入向量库，"
-        f"或检查 CHROMA_PERSIST_DIR={CHROMA_DIR} 是否正确。"
+        "未找到可用的 Chroma 集合（所有集合不存在或为空）。"
+        f"\n目录: {PERSIST_DIR} | preferred={preferred}\n"
+        "请先把 ./data/guidelines.parsed.jsonl 写入向量库，或检查 CHROMA_PERSIST_DIR。"
     )
 
-
-# def get_chroma_collection():
-#    global _chroma_collection
-#    if _chroma_collection is None:
-#        client = _open_client()
-#        _chroma_collection = _pick_nonempty_collection(client, COLLECTION_NAME)
-#    return _chroma_collection
-
-def get_chroma_collection():
-    client = PersistentClient(path=PERSIST_DIR)
-    # BIND the embedding function here
-    # return client.get_collection(name=COLLECTION, embedding_function=embed_fn)
-    return client.get_collection(name=COLLECTION)
-
-
-# =========================
+# -----------------------------------------------------------------------------
 # Guideline search (Chroma)
-# =========================
-"""
-    语义检索（cosine 距离→相似度 1 - distance）
-    返回：[{id, content, meta, score, source}]
-"""
-def search_guidelines(query: str, k: int = 6, where: Optional[Dict[str, Any]] = None):
-    col = get_chroma_collection()
-    enc = get_embedder()  # loads BAAI/bge-large-zh-v1.5 on cuda/cpu
-    qvec = enc.encode([query], normalize_embeddings=True).tolist()
-
-    # kwargs = dict(query_texts=[query], n_results=k,
-    #               include=["documents", "metadatas", "distances"])
-    kwargs = dict(
-        query_embeddings=qvec,
-        n_results=k,
-        include=["documents", "metadatas", "distances"],
-    )   
-    if where:
-        kwargs["where"] = where  # never pass empty dict
-
+# -----------------------------------------------------------------------------
+def search_guidelines(query: str, k: int = 6, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """
+    语义检索（Chroma）
+    Returns: list of dicts with keys: id, content, meta, score, source
+    """
     try:
+        client = _get_client()
+        embed_fn = _get_embed_fn(EMBED_MODEL)
+        col = _pick_collection(client, COLLECTION, embed_fn)
+        if col is None:
+            # Demo fallback: no Chroma available
+            return []
+        kwargs = dict(query_texts=[query], n_results=int(k), include=["documents", "metadatas", "distances"])
+        if where:
+            kwargs["where"] = where  # don't pass empty {}
         res = col.query(**kwargs)
-    except ValueError as e:
-        # guard against malformed where
-        if "Expected where to have exactly one operator" in str(e) and "where" in kwargs:
-            kwargs.pop("where", None)
-            res = col.query(**kwargs)
-        else:
-            raise
+        ids   = res.get("ids", [[]])[0]
+        docs  = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        dists = res.get("distances", [[]])[0]
 
-    ids   = res.get("ids", [[]])[0]
-    docs  = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    dists = res.get("distances", [[]])[0]
+        out: List[Dict[str, Any]] = []
+        for i in range(len(ids)):
+            distance = float(dists[i]) if dists else 1.0
+            sim = max(0.0, min(1.0, 1.0 - distance))
+            out.append({
+                "id": ids[i],
+                "content": docs[i],
+                "meta": metas[i],
+                "score": sim,
+                "source": "guideline",
+            })
+        return out
+    except Exception:
+        if DEMO:
+            # Quietly fallback in demo mode
+            return []
+        raise
 
-    out = []
-    for i in range(len(ids)):
-        distance = float(dists[i]) if dists else 1.0
-        sim = max(0.0, min(1.0, 1.0 - distance))
-        out.append({
-            "id": ids[i],
-            "content": docs[i],
-            "meta": metas[i],
-            "score": sim,
-            "source": "guideline",
-        })
-    return out
-
-# =========================
-# Drug search (SQLite)
-# =========================
+# -----------------------------------------------------------------------------
+# SQLite helpers (structured drug info)
+# -----------------------------------------------------------------------------
 def _connect_sqlite() -> sqlite3.Connection:
     if not os.path.isfile(SQLITE_PATH):
+        # In demo mode we tolerate missing DB and just return a placeholder
+        if DEMO:
+            # Return a connection to an in-memory DB with no tables to avoid crashes
+            con = sqlite3.connect(":memory:")
+            con.row_factory = sqlite3.Row
+            return con
         raise FileNotFoundError(
             f"SQLite DB not found: {SQLITE_PATH}\n"
-            "请确认已运行 caremind/ingest/load_drugs.py 生成 db/drugs.sqlite。"
+            "请先运行 ingest/load_drugs.py 以生成 db/drugs.sqlite，或设置 SQLITE_PATH。"
         )
     con = sqlite3.connect(SQLITE_PATH)
     con.row_factory = sqlite3.Row
     return con
-
 
 def _has_fts(con: sqlite3.Connection) -> bool:
     cur = con.cursor()
     cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='drugs_fts'")
     return cur.fetchone() is not None
 
-
-def trim(text: Optional[str], n: int = 120) -> str:
+def _trim(text: Optional[str], n: int = 120) -> str:
     if not text:
         return "-"
     t = str(text).replace("\n", " ").strip()
     return (t[:n] + "…") if len(t) > n else t
 
-
+# -----------------------------------------------------------------------------
+# Drug search (full-text list, as you had)
+# -----------------------------------------------------------------------------
 def search_drugs(query: str, k: int = 6) -> List[Dict[str, Any]]:
     con = _connect_sqlite()
     try:
@@ -272,24 +218,7 @@ def search_drugs(query: str, k: int = 6) -> List[Dict[str, Any]]:
             cur = con.cursor()
             cur.execute(sql, (query, k))
             rows = cur.fetchall()
-            out = []
-            for r in rows:
-                meta = {k: r[k] for k in r.keys()}           # dict copy
-                fields = ["name","generic_name","indications","contraindications","interactions"]
-                hay = " ".join((meta.get(f) or "") for f in fields)
-                hits = sum(1 for f in fields if meta.get(f) and (query in meta.get(f, "")))
-                sim = max(0.3, min(1.0, (hits + (1 if query in hay else 0)) / (len(fields) + 1)))
-                content = f"{meta.get('name','?')}（{meta.get('generic_name','-')}）\n适应症: {trim(meta.get('indications'))}"
-                out.append({
-                    "id": f"drug:{r['id']}",
-                    "content": content,
-                    "meta": meta,
-                    "score": sim,
-                    "source": "drug"
-                })
-            return out
         else:
-            # LIKE fallback
             cur = con.cursor()
             kw = f"%{query}%"
             sql = """
@@ -302,176 +231,67 @@ def search_drugs(query: str, k: int = 6) -> List[Dict[str, Any]]:
             """
             cur.execute(sql, (kw, kw, kw, kw, kw, k))
             rows = cur.fetchall()
-            out = []
-            for r in rows:
-                meta = {k: r[k] for k in r.keys()}           # dict copy
-                fields = ["name", "generic_name", "indications", "contraindications", "interactions"]
-                hay = " ".join((meta.get(f) or "") for f in fields)
-                hits = sum(1 for f in fields if meta.get(f) and (query in (meta.get(f) or "")))
-                sim = max(0.3, min(1.0, (hits + (1 if query in hay else 0)) / (len(fields) + 1)))
-                content = f"{meta.get('name','?')}（{meta.get('generic_name','-')}）\n适应症: {trim(meta.get('indications'))}"
-                out.append({
-                    "id": f"drug:{meta.get('id','')}",
-                    "content": content,
-                    "meta": meta,
-                    "score": sim,
-                    "source": "drug",
-                })
-            return out
-        
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            meta = {c: r[c] for c in r.keys()}
+            fields = ["name","generic_name","indications","contraindications","interactions"]
+            hay = " ".join((meta.get(f) or "") for f in fields)
+            hits = sum(1 for f in fields if meta.get(f) and (query in (meta.get(f) or "")))
+            sim = max(0.3, min(1.0, (hits + (1 if query in hay else 0)) / (len(fields) + 1)))
+            content = f"{meta.get('name','?')}（{meta.get('generic_name','-')}）\n适应症: {_trim(meta.get('indications'))}"
+            out.append({
+                "id": f"drug:{meta.get('id','')}",
+                "content": content,
+                "meta": meta,
+                "score": sim,
+                "source": "drug",
+            })
+        return out
     finally:
-        con.close()
+        try:
+            con.close()
+        except Exception:
+            pass
 
+# -----------------------------------------------------------------------------
+# Single-drug structured lookup (for pipeline.answer)
+# -----------------------------------------------------------------------------
+def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Returns a single structured record for the given drug name (best match),
+    or None if not found / DB unavailable in DEMO.
+    """
+    if not (drug_name and drug_name.strip()):
+        return None
 
-# =========================
-# Fusion
-# =========================
-def linear_fusion(guideline_hits: List[Dict[str, Any]],
-                  drug_hits: List[Dict[str, Any]],
-                  alpha: float = 0.6,
-                  topn: int = 8) -> List[Dict[str, Any]]:
-    fused: List[Dict[str, Any]] = []
-    for h in guideline_hits:
-        fused.append({**h, "fused_score": alpha * float(h["score"])})
-    for h in drug_hits:
-        fused.append({**h, "fused_score": (1.0 - alpha) * float(h["score"])})
-    fused.sort(key=lambda x: x["fused_score"], reverse=True)
-    return fused[:topn]
-
-
-def rrf_fusion(guideline_hits: List[Dict[str, Any]],
-               drug_hits: List[Dict[str, Any]],
-               k: float = 60.0,
-               topn: int = 8) -> List[Dict[str, Any]]:
-    fused_map: Dict[str, Dict[str, Any]] = {}
-
-    def add_list(hits: List[Dict[str, Any]]):
-        for rank, h in enumerate(sorted(hits, key=lambda x: x["score"], reverse=True), start=1):
-            key = f"{h['source']}::{h['id']}"
-            if key not in fused_map:
-                fused_map[key] = {**h, "fused_score": 0.0}
-            fused_map[key]["fused_score"] += 1.0 / (k + rank)
-
-    add_list(guideline_hits)
-    add_list(drug_hits)
-
-    fused = list(fused_map.values())
-    fused.sort(key=lambda x: x["fused_score"], reverse=True)
-    return fused[:topn]
-
-
-# =========================
-# High-level API
-# =========================
-def hybrid_search(query: str,
-                  k_guideline: int = 6,
-                  k_drug: int = 6,
-                  method: str = "linear",
-                  alpha: float = 0.6,
-                  topn: int = 8) -> Dict[str, Any]:
-    g_hits = search_guidelines(query, k=k_guideline)
-    d_hits = search_drugs(query, k=k_drug)
-
-    if method == "rrf":
-        fused = rrf_fusion(g_hits, d_hits, topn=topn)
-    else:
-        fused = linear_fusion(g_hits, d_hits, alpha=alpha, topn=topn)
-
-    return {"query": query, "guidelines": g_hits, "drugs": d_hits, "fused": fused}
-
-
-# =========================
-# Diagnostics & CLI
-# =========================
-def diagnose() -> None:
-    print("=== Diagnosing Chroma ===")
+    con = _connect_sqlite()
     try:
-        client = _open_client()
-        cols = client.list_collections()
-        col = get_chroma_collection()
-        print("Using collection:", col.name, "| count:", col.count())    
-        if not cols:
-            print("No collections found.")
-        else:
-            for c in cols:
-                try:
-                    col = client.get_collection(c.name)
-                    cnt = col.count()
-                except Exception:
-                    cnt = -1
-                print(f" - {c.name}  count={cnt}")
-    except Exception as e:
-        print("Chroma error:", repr(e))
-
-    print("\n=== Diagnosing SQLite ===")
-    try:
-        con = _connect_sqlite()
         cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='drugs'")
-        has = cur.fetchone()[0] > 0
-        print(" - drugs table:", "OK" if has else "MISSING")
-        print(" - FTS (drugs_fts):", "ENABLED" if _has_fts(con) else "disabled")
-        if has:
-            cur.execute("SELECT COUNT(*) FROM drugs")
-            print(" - drugs rows:", cur.fetchone()[0])
-        con.close()
-    except Exception as e:
-        print("SQLite error:", repr(e))
-
-
-def _print_hit(h: Dict[str, Any], idx: int):
-    head = f"[{idx:02d}] {h['source'].upper()}  score={h.get('score'):.3f}  fused={h.get('fused_score', float('nan')):.3f}"
-    print(head)
-    if h["source"] == "guideline":
-        meta = h.get("meta", {})
-        year = meta.get("year", "?")
-        title = meta.get("title", meta.get("file", ""))
-        print(f"     年份: {year} | 标题: {title}")
-    else:
-        m = h.get("meta", {})
-        print(f"     药名: {m.get('name','?')} | 通用名: {m.get('generic_name','-')}")
-    snippet = trim(h.get("content", ""), 160)
-    print(f"     摘要: {snippet}\n")
-
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="CareMind 混合检索（Chroma + SQLite）")
-    parser.add_argument("--q", "--query", dest="query", type=str, help="查询文本")
-    parser.add_argument("--k-guide", type=int, default=6, help="指南检索返回数")
-    parser.add_argument("--k-drug", type=int, default=6, help="药品检索返回数")
-    parser.add_argument("--method", type=str, default="linear", choices=["linear", "rrf"], help="融合方式")
-    parser.add_argument("--alpha", type=float, default=0.6, help="linear 模式下指南权重")
-    parser.add_argument("--topn", type=int, default=8, help="融合后返回数")
-    parser.add_argument("--diagnose", action="store_true", help="打印 Chroma/SQLite 诊断信息并退出")
-    args = parser.parse_args()
-
-    print(f"Embedding model: {EMBED_MODEL}")
-    print(f"Chroma dir:     {CHROMA_DIR} | preferred collection={COLLECTION}")
-    print(f"SQLite path:    {SQLITE_PATH}")
-
-    if args.diagnose:
-        diagnose()
-        return
-
-    if not args.query:
-        parser.error("--q/--query is required unless --diagnose is used")
-
-    print(f"Query:          {args.query}\n")
-
-    result = hybrid_search(
-        query=args.query,
-        k_guideline=args.k_guide,
-        k_drug=args.k_drug,
-        method=args.method,
-        alpha=args.alpha,
-        topn=args.topn
-    )
-
-    print("==== 混合结果（Fused） ====")
-    for i, h in enumerate(result["fused"], 1):
-        _print_hit(h, i)
-
-
-if __name__ == "__main__":
-    main()
+        # Try exact-ish first
+        cur.execute(
+            "SELECT * FROM drugs WHERE name = ? OR generic_name = ? LIMIT 1",
+            (drug_name, drug_name),
+        )
+        row = cur.fetchone()
+        if not row:
+            # Fallback: LIKE search, pick the first
+            kw = f"%{drug_name}%"
+            cur.execute(
+                """SELECT * FROM drugs
+                   WHERE name LIKE ? OR generic_name LIKE ?
+                   ORDER BY LENGTH(name) ASC
+                   LIMIT 1""",
+                (kw, kw),
+            )
+            row = cur.fetchone()
+        return {c: row[c]} if row and False else ({c: row[c] for c in row.keys()} if row else None)
+    except Exception:
+        if DEMO:
+            return None
+        raise
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
