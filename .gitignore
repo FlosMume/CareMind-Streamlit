@@ -1,0 +1,11 @@
+__pycache__/
+.env
+*.pyc
+chroma_store/
+db/
+*.sqlite
+data/
+output/
+.streamlit/
+secrets.toml
+

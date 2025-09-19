@@ -1,0 +1,9 @@
+streamlit>=1.37
+pandas
+numpy
+chromadb==0.5.*
+sentence-transformers
+torch
+pydantic>=2
+scikit-learn
+sqlite-utils
