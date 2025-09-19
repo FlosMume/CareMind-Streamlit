@@ -1,18 +1,9 @@
-# ---- UI ----
-streamlit==1.49.1
-
-# ---- Vector DB ----
-chromadb==0.5.5
-pydantic<3
-numpy<2.0
-pysqlite3-binary==0.5.2.post3
-
-<<<<<<< HEAD
-# ---- Embeddings (Torch ≥ 2.6 needed for CVE fix) ----
-sentence-transformers==3.0.1
-torch==2.6.0
---extra-index-url https://download.pytorch.org/whl/cpu
-=======
-# 关键：在 Streamlit Cloud 上提供 SQLite 动态库
-pysqlite3-binary==0.5.4
->>>>>>> bc8a0fc (avoid non exsisting pysqlite3-binary==0.5.3.post3)
+streamlit>=1.37
+pandas
+numpy
+chromadb==0.5.*
+sentence-transformers
+torch
+pydantic>=2
+scikit-learn
+sqlite-utils
