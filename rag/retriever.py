@@ -1,292 +1,207 @@
 # -*- coding: utf-8 -*-
 """
-CareMind | Retrieval helpers (Chroma + SQLite)
-- Streamlit Cloud friendly: modern SQLite shim, lazy chroma import.
-- Public API:
-    search_guidelines(query: str, k: int = 6) -> list[dict]
-    search_drugs(query: str, k: int = 6) -> list[dict]
-    search_drug_structured(drug_name: str) -> dict | None
+retriever.py | CareMind
+-----------------------
+职责 / Responsibilities
+1) 在 Chroma 向量库中检索指南片段
+   Retrieve guideline text chunks from a Chroma vector DB.
+2) 在 SQLite 中查询药品结构化信息
+   Look up structured drug info in SQLite.
+
+设计要点 / Design Notes
+- 为了兼容 Streamlit Cloud 的较旧 sqlite3，优先使用 pysqlite3-binary 作为替代。
+  Use pysqlite3-binary to provide a modern sqlite3 on Streamlit Cloud.
+- 对 chroma 的导入采用“惰性导入”（在函数内导入），防止模块导入阶段直接失败。
+  Lazy-import chroma inside functions to avoid import-time crashes.
+- 返回尽量朴素的 Python dict / list，方便上层 pipeline 与 UI 处理。
+  Return plain dict/list structures for easy handling by pipeline/UI.
 """
 
 from __future__ import annotations
+
 import os
 import sys
 from typing import Any, Dict, List, Optional
 
+# =============================================================================
+# 0) SQLite 兼容补丁（Streamlit Cloud 常见问题）
+#    SQLite compatibility patch for Streamlit Cloud
 # -----------------------------------------------------------------------------
-# Environment / defaults (kept compatible with your previous code)
-# -----------------------------------------------------------------------------
-CHROMA_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-PERSIST_DIR: str = CHROMA_DIR  # alias
-COLLECTION: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks_1024_v2")
-SQLITE_PATH: str = os.getenv("SQLITE_PATH", "./db/drugs.sqlite")
-EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
-DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"  # default ON in Cloud
+# 如果存在 pysqlite3，则把它映射为标准库 sqlite3，以获得较新的 SQLite 版本（>=3.35）
+# If pysqlite3 exists, alias it to stdlib sqlite3 to get a newer SQLite (>=3.35).
+try:
+    import pysqlite3  # type: ignore
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    # 不可用时，继续使用系统自带 sqlite3；如后续 Chroma 需要更高版本，会在运行时报错
+    # If unavailable, keep system sqlite3; Chroma may later complain if too old.
+    pass
 
-# -----------------------------------------------------------------------------
-# Ensure a modern SQLite on hosts with old stdlib sqlite3 (Cloud fix)
-# -----------------------------------------------------------------------------
-def _alias_sqlite_if_needed() -> None:
-    try:
-        import sqlite3  # noqa: F401
-        # Quick feature test: FTS5 exists from SQLite 3.9+, Chroma wants >=3.35
-        # We still alias proactively if pysqlite3 is available.
-        pass
-    except Exception:
-        pass
-    try:
-        import pysqlite3  # provided by pysqlite3-binary
-        sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
-    except Exception:
-        # If not available, we proceed; Chroma may later raise a clear error.
-        pass
+import sqlite3  # after aliasing
 
-_alias_sqlite_if_needed()
-import sqlite3  # now safe to import
 
+# =============================================================================
+# 1) 环境变量与默认配置 / Env vars & defaults
 # -----------------------------------------------------------------------------
-# Lazy chroma import (so app boots even if Chroma/SQLite not ready)
+CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+CHROMA_COLLECTION: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
+EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+DRUG_DB_PATH: str = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")
+DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"  # 云端默认演示模式 ON / demo ON by default on Cloud
+
+
+# =============================================================================
+# 2) 惰性导入 Chroma / Lazy-import Chroma
 # -----------------------------------------------------------------------------
 def _chroma():
     """
-    Import chromadb only when we actually need it.
-    Returns (PersistentClient, embedding_functions)
+    惰性导入 Chroma 所需对象；在真正需要时才导入。
+    Lazy-import chroma objects; import only when actually needed.
+
+    Returns
+    -------
+    (PersistentClient, embedding_functions)
     """
     from chromadb import PersistentClient
     from chromadb.utils import embedding_functions
     return PersistentClient, embedding_functions
 
-def _get_embed_fn(model_name: str = EMBED_MODEL):
-    """
-    Returns a SentenceTransformerEmbeddingFunction (lazy load).
-    """
-    _, embedding_functions = _chroma()
-    return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
 
-def _get_client() -> "PersistentClient":
-    PersistentClient, _ = _chroma()
-    if not os.path.isdir(PERSIST_DIR):
-        raise FileNotFoundError(
-            f"Chroma dir not found: {PERSIST_DIR}\n"
-            "请先构建向量库（运行你的向量化脚本）或设置 CHROMA_PERSIST_DIR。"
+# =============================================================================
+# 3) 指南检索（Chroma）/ Guideline search (Chroma)
+# -----------------------------------------------------------------------------
+def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
+    """
+    使用 Chroma 进行语义检索，返回文本片段与元数据。
+    Semantic search against Chroma; return snippets with metadata.
+
+    Parameters
+    ----------
+    query : str   # 可为中文或英文 | can be Chinese or English
+    k     : int   # 返回的片段数量 | number of top results
+
+    Returns
+    -------
+    List[dict]    # [{"content": str, "meta": dict}, ...]
+    """
+    try:
+        # 1) 获取 Chroma 客户端与嵌入函数 / get client & embedding fn
+        PersistentClient, embedding_functions = _chroma()
+        client = PersistentClient(path=CHROMA_PERSIST_DIR)
+
+        # 2) 绑定集合（不存在则创建）/ bind collection (create if missing)
+        embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=EMBED_MODEL
         )
-    return PersistentClient(path=PERSIST_DIR)
+        collection = client.get_or_create_collection(
+            name=CHROMA_COLLECTION,
+            embedding_function=embed_fn,
+        )
 
-def _pick_collection(client: "PersistentClient", preferred: str, embed_fn) -> Any:
-    """
-    选择可用集合：
-      1) preferred 存在且非空 → 用它
-      2) 否则扫描非空集合 → 用第一个
-      3) 否则抛错（或在 DEMO 下返回 None）
-    """
-    def bind(name: str):
-        try:
-            return client.get_collection(name=name, embedding_function=embed_fn)
-        except Exception:
-            return None
+        # 3) 查询 / query
+        res = collection.query(
+            query_texts=[query],
+            n_results=int(k),
+            include=["documents", "metadatas"],
+        )
 
-    # Try preferred
-    col = bind(preferred)
-    if col:
-        try:
-            if col.count() > 0:
-                return col
-        except Exception:
-            # Old chroma may fail count(); try a minimal query
-            try:
-                res = col.query(query_texts=["."], n_results=1)
-                if res and res.get("ids") and res["ids"][0]:
-                    return col
-            except Exception:
-                pass
-
-    # Try any non-empty collection
-    try:
-        for c in client.list_collections():
-            col = bind(c.name)
-            if not col:
-                continue
-            try:
-                if col.count() > 0:
-                    return col
-            except Exception:
-                try:
-                    res = col.query(query_texts=["."], n_results=1)
-                    if res and res.get("ids") and res["ids"][0]:
-                        return col
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    if DEMO:
-        # In demo mode, returning None allows the app to render without hard failing.
-        return None
-
-    raise RuntimeError(
-        "未找到可用的 Chroma 集合（所有集合不存在或为空）。"
-        f"\n目录: {PERSIST_DIR} | preferred={preferred}\n"
-        "请先把 ./data/guidelines.parsed.jsonl 写入向量库，或检查 CHROMA_PERSIST_DIR。"
-    )
-
-# -----------------------------------------------------------------------------
-# Guideline search (Chroma)
-# -----------------------------------------------------------------------------
-def search_guidelines(query: str, k: int = 6, where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """
-    语义检索（Chroma）
-    Returns: list of dicts with keys: id, content, meta, score, source
-    """
-    try:
-        client = _get_client()
-        embed_fn = _get_embed_fn(EMBED_MODEL)
-        col = _pick_collection(client, COLLECTION, embed_fn)
-        if col is None:
-            # Demo fallback: no Chroma available
-            return []
-        kwargs = dict(query_texts=[query], n_results=int(k), include=["documents", "metadatas", "distances"])
-        if where:
-            kwargs["where"] = where  # don't pass empty {}
-        res = col.query(**kwargs)
-        ids   = res.get("ids", [[]])[0]
-        docs  = res.get("documents", [[]])[0]
+        # 4) 结果整形 / shape results
+        docs = res.get("documents", [[]])[0]
         metas = res.get("metadatas", [[]])[0]
-        dists = res.get("distances", [[]])[0]
-
         out: List[Dict[str, Any]] = []
-        for i in range(len(ids)):
-            distance = float(dists[i]) if dists else 1.0
-            sim = max(0.0, min(1.0, 1.0 - distance))
-            out.append({
-                "id": ids[i],
-                "content": docs[i],
-                "meta": metas[i],
-                "score": sim,
-                "source": "guideline",
-            })
+        for d, m in zip(docs, metas):
+            out.append({"content": d, "meta": m})
         return out
-    except Exception:
-        if DEMO:
-            # Quietly fallback in demo mode
-            return []
-        raise
 
+    except Exception as e:
+        # 失败时的温和降级：打印日志并返回空列表（让上层决定如何回退）
+        # Soft-degrade: log & return empty so pipeline can handle demo fallback.
+        print("[retriever] search_guidelines error:", e)
+        return []
+
+
+# =============================================================================
+# 4) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
 # -----------------------------------------------------------------------------
-# SQLite helpers (structured drug info)
-# -----------------------------------------------------------------------------
-def _connect_sqlite() -> sqlite3.Connection:
-    if not os.path.isfile(SQLITE_PATH):
-        # In demo mode we tolerate missing DB and just return a placeholder
+def _connect_sqlite(path: str) -> sqlite3.Connection:
+    """
+    打开 SQLite 连接（行工厂设置为 dict-like Row）
+    Open SQLite connection; row_factory -> sqlite3.Row for dict-like access.
+    """
+    if not os.path.exists(path):
         if DEMO:
-            # Return a connection to an in-memory DB with no tables to avoid crashes
+            # 演示模式下容忍缺库：返回内存库，避免崩溃（无表即无结果）
+            # In demo mode tolerate missing DB: return in-memory DB to avoid crashes.
             con = sqlite3.connect(":memory:")
             con.row_factory = sqlite3.Row
             return con
-        raise FileNotFoundError(
-            f"SQLite DB not found: {SQLITE_PATH}\n"
-            "请先运行 ingest/load_drugs.py 以生成 db/drugs.sqlite，或设置 SQLITE_PATH。"
-        )
-    con = sqlite3.connect(SQLITE_PATH)
+        raise FileNotFoundError(f"SQLite DB not found: {path}")
+
+    con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     return con
 
-def _has_fts(con: sqlite3.Connection) -> bool:
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='drugs_fts'")
-    return cur.fetchone() is not None
 
-def _trim(text: Optional[str], n: int = 120) -> str:
-    if not text:
-        return "-"
-    t = str(text).replace("\n", " ").strip()
-    return (t[:n] + "…") if len(t) > n else t
-
-# -----------------------------------------------------------------------------
-# Drug search (full-text list, as you had)
-# -----------------------------------------------------------------------------
-def search_drugs(query: str, k: int = 6) -> List[Dict[str, Any]]:
-    con = _connect_sqlite()
-    try:
-        if _has_fts(con):
-            sql = """
-                SELECT d.*, bm25(drugs_fts) AS rank
-                FROM drugs_fts JOIN drugs d ON d.rowid = drugs_fts.rowid
-                WHERE drugs_fts MATCH ?
-                ORDER BY rank ASC
-                LIMIT ?
-            """
-            cur = con.cursor()
-            cur.execute(sql, (query, k))
-            rows = cur.fetchall()
-        else:
-            cur = con.cursor()
-            kw = f"%{query}%"
-            sql = """
-                SELECT *
-                FROM drugs
-                WHERE name LIKE ? OR generic_name LIKE ?
-                   OR indications LIKE ? OR contraindications LIKE ?
-                   OR interactions LIKE ?
-                LIMIT ?
-            """
-            cur.execute(sql, (kw, kw, kw, kw, kw, k))
-            rows = cur.fetchall()
-
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            meta = {c: r[c] for c in r.keys()}
-            fields = ["name","generic_name","indications","contraindications","interactions"]
-            hay = " ".join((meta.get(f) or "") for f in fields)
-            hits = sum(1 for f in fields if meta.get(f) and (query in (meta.get(f) or "")))
-            sim = max(0.3, min(1.0, (hits + (1 if query in hay else 0)) / (len(fields) + 1)))
-            content = f"{meta.get('name','?')}（{meta.get('generic_name','-')}）\n适应症: {_trim(meta.get('indications'))}"
-            out.append({
-                "id": f"drug:{meta.get('id','')}",
-                "content": content,
-                "meta": meta,
-                "score": sim,
-                "source": "drug",
-            })
-        return out
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-# -----------------------------------------------------------------------------
-# Single-drug structured lookup (for pipeline.answer)
-# -----------------------------------------------------------------------------
 def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
     """
-    Returns a single structured record for the given drug name (best match),
-    or None if not found / DB unavailable in DEMO.
+    在 SQLite 中按名称模糊检索药品的结构化信息（示例字段）。
+    Fuzzy lookup a drug's structured info in SQLite (example schema).
+
+    Parameters
+    ----------
+    drug_name : str  # 关键词（如 '阿司匹林' 或 'Aspirin'）
+
+    Returns
+    -------
+    dict | None      # e.g. {"name": ..., "indications": ..., ...} or None
     """
-    if not (drug_name and drug_name.strip()):
+    name = (drug_name or "").strip()
+    if not name:
         return None
 
-    con = _connect_sqlite()
+    con = _connect_sqlite(DRUG_DB_PATH)
     try:
         cur = con.cursor()
-        # Try exact-ish first
+
+        # 先尝试“近似精确匹配” / try near-exact match first
         cur.execute(
-            "SELECT * FROM drugs WHERE name = ? OR generic_name = ? LIMIT 1",
-            (drug_name, drug_name),
+            """
+            SELECT name, generic_name, indications, contraindications,
+                   interactions, pregnancy, source
+            FROM drugs
+            WHERE name = ? OR generic_name = ?
+            LIMIT 1
+            """,
+            (name, name),
         )
         row = cur.fetchone()
+
+        # 若无命中则做 LIKE 模糊检索 / fallback to LIKE search
         if not row:
-            # Fallback: LIKE search, pick the first
-            kw = f"%{drug_name}%"
+            kw = f"%{name}%"
             cur.execute(
-                """SELECT * FROM drugs
-                   WHERE name LIKE ? OR generic_name LIKE ?
-                   ORDER BY LENGTH(name) ASC
-                   LIMIT 1""",
+                """
+                SELECT name, generic_name, indications, contraindications,
+                       interactions, pregnancy, source
+                FROM drugs
+                WHERE name LIKE ? OR generic_name LIKE ?
+                ORDER BY LENGTH(name) ASC
+                LIMIT 1
+                """,
                 (kw, kw),
             )
             row = cur.fetchone()
-        return {c: row[c]} if row and False else ({c: row[c] for c in row.keys()} if row else None)
-    except Exception:
+
+        if not row:
+            return None
+
+        keys = ["name", "generic_name", "indications", "contraindications",
+                "interactions", "pregnancy", "source"]
+        return {k: row[idx] for idx, k in enumerate(keys)}
+
+    except Exception as e:
+        print("[retriever] search_drug_structured error:", e)
         if DEMO:
             return None
         raise

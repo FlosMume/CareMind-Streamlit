@@ -225,7 +225,7 @@ if submitted:
         with st.spinner("..."):
             try:
                 t0 = time.time()
-                res = answer(q.strip(), drug_name=(drug.strip() or None), k=int(k))
+                res = answer(q.strip(), drug_name=(drug.strip() or None), k=int(k), lang=lang)
                 elapsed = time.time() - t0
             except Exception as e:
                 st.error(t(lang, "err_backend"))
