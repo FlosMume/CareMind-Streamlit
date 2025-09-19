@@ -203,18 +203,19 @@ PRESETS = {
 # UI 配置 & 轻量样式
 # ---------------------------
 st.set_page_config(page_title="CareMind · MVP CDSS", layout="wide", page_icon="💊")
-st.markdown(
-    """
-    <style>
-    .cm-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;background:#eef2ff;border:1px solid #c7d2fe;margin-right:6px;white-space:nowrap;}
-    .cm-chip{display:inline-block;padding:2px 8px;border-radius:8px;font-size:12px;background:#f1f5f9;border:1px solid #e2e8f0;margin:0 6px 6px 0;}
-    .cm-muted{color:#64748b;font-size:13px;}
-    .cm-output{line-height:1.75;font-size:17px;}
-    footer{visibility:hidden;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# type: ignore
+CSS = """
+<style>
+.cm-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;background:#eef2ff;border:1px solid #c7d2fe;margin-right:6px;white-space:nowrap;}
+.cm-chip{display:inline-block;padding:2px 8px;border-radius:8px;font-size:12px;background:#f1f5f9;border:1px solid #e2e8f0;margin:0 6px 6px 0;}
+.cm-muted{color:#64748b;font-size:13px;}
+.cm-output{line-height:1.75;font-size:17px;}
+footer{visibility:hidden;}
+</style>
+"""
+
+st.markdown(CSS, unsafe_allow_html=True)
+
 
 # ---------------------------
 # Sidebar：检索与显示设置
