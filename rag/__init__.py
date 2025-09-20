@@ -1,2 +1,1 @@
-# rag/__init__.py
-# CareMind RAG package initializer
+# keep empty to avoid accidental re-exports
