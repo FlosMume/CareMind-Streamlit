@@ -8,15 +8,17 @@ retriever.py | CareMind
 2) 在 SQLite 中查询药品结构化信息
    Look up structured drug info in SQLite.
 
-设计要点 / Design Notes
-- Cloud 常见问题：系统自带 sqlite3 版本可能过旧；使用 pysqlite3-binary 作为替代并别名到 sqlite3。
-  Streamlit Cloud may ship an old sqlite3; alias pysqlite3-binary to sqlite3 for >=3.35 features.
-- Chroma 采用“惰性导入”，避免导入阶段崩溃；只有在真正查询时才加载。
-  Chroma is lazy-imported so module import never fails—only load it when needed.
-- 通过 chromadb.config.Settings 关闭匿名遥测，解决 “Failed to send telemetry ClientStartEvent … get_settings” 噪声。
-  Use chromadb.config.Settings to disable telemetry (stops the ClientStartEvent/get_settings noise).
-- 返回朴素 dict/list，便于 pipeline 与 UI 处理。
-  Return plain dicts/lists so pipeline/UI can compose responses easily.
+关键设计 / Key design choices
+- ✅ Cloud 兼容：把 pysqlite3-binary 别名为 sqlite3，规避旧版 sqlite3 导致的 Chroma 报错。
+  Cloud-compat: alias pysqlite3-binary → sqlite3 to satisfy Chroma's sqlite ≥3.35.
+- ✅ 惰性导入 Chroma：只在函数调用时导入，防止模块导入阶段崩溃。
+  Lazy import chroma so the module never crashes during import.
+- ✅ 关闭 Chroma 遥测：通过 chromadb.config.Settings(anonymized_telemetry=False)。
+  Disable Chroma telemetry via Settings to silence ClientStartEvent noise.
+- ✅ Secrets 优先：通过 _env() 读取配置（先 Secrets，再环境变量，最后默认）。
+  Secrets-first config via _env() (Secrets → env → default).
+- ✅ 安全的集合枚举：list_collections_safe() 仅返回 {name, count}，避免 _type 等序列化问题。
+  Safe collection listing that avoids serializing Chroma internals like `_type`.
 """
 
 from __future__ import annotations
@@ -28,12 +30,14 @@ from typing import Any, Dict, List, Optional
 # =============================================================================
 # 0) SQLite 兼容补丁（Cloud）/ SQLite compatibility shim (Cloud)
 # -----------------------------------------------------------------------------
-# 如果安装了 pysqlite3-binary，则把它映射为标准库 sqlite3，以获得新版本 SQLite(>=3.35)
-# If pysqlite3-binary is present, alias it to stdlib sqlite3 to get >=3.35 features.
+# 如果安装了 pysqlite3-binary，则将其别名为标准库 sqlite3，以获得 SQLite ≥ 3.35
+# If pysqlite3-binary is present, alias it to stdlib sqlite3 to get SQLite ≥ 3.35.
 try:
     import pysqlite3  # type: ignore
     sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 except Exception:
+    # 如果不可用，则继续使用系统自带 sqlite3；若版本过低，Chroma 端可能在运行时报错
+    # If unavailable, we keep system sqlite3; Chroma may later complain if too old.
     pass
 
 import sqlite3  # after aliasing
@@ -48,13 +52,13 @@ def _env(key: str, default: str | None = None) -> str | None:
     Prefer st.secrets on Cloud, then os.environ, otherwise default.
     """
     try:
-        import streamlit as st  # imported lazily; safe outside Streamlit too
+        import streamlit as st  # imported lazily; safe when Streamlit is absent
         return os.getenv(key, st.secrets.get(key, default))
     except Exception:
         return os.getenv(key, default)
 
 def _as_bool(val: str | None, default: bool = False) -> bool:
-    """将 '1'/'true'/'True'/'yes' 等解析为布尔值 / Parse common truthy strings to bool."""
+    """将 '1'/'true'/'yes' 等解析为布尔值 / Parse common truthy strings to bool."""
     if val is None:
         return default
     return str(val).strip().lower() in {"1", "true", "yes", "on"}
@@ -71,7 +75,7 @@ DRUG_DB_PATH: str       = _env("DRUG_DB_PATH",       "./db/drugs.sqlite") or "./
 DEMO: bool              = _as_bool(_env("CAREMIND_DEMO", "1"), default=True)
 
 # 允许通过 Secrets/env 覆盖是否关闭 Chroma 遥测（默认关闭）
-# Allow overriding anonymized telemetry via Secrets/env (default: off)
+# Allow overriding anonymized telemetry via Secrets/env (default: OFF)
 CHROMA_TELEMETRY_OFF: bool = not _as_bool(_env("CHROMA_ANONYMIZED_TELEMETRY", "False"), default=False)
 
 
@@ -82,10 +86,14 @@ def _chroma():
     """
     惰性导入 Chroma；返回 (PersistentClient, embedding_functions, Settings)
     Lazy-import chroma; return (PersistentClient, embedding_functions, Settings).
+
+    说明 / Notes:
+    - 仅在需要访问向量库时才导入，避免模块导入期失败。
+      Importing only when needed avoids import-time crashes on Cloud.
     """
     from chromadb import PersistentClient
     from chromadb.utils import embedding_functions
-    from chromadb.config import Settings  # 0.5.x: use Settings to configure client
+    from chromadb.config import Settings  # 0.5.x: use Settings to configure the client
     return PersistentClient, embedding_functions, Settings
 
 
@@ -95,23 +103,30 @@ def _chroma():
 def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
     """
     使用 Chroma 进行语义检索；返回 [{"content": 文本, "meta": 元数据}, ...]
-    Semantic search via Chroma; returns [{"content": str, "meta": dict}, ...]
+    Semantic search via Chroma; returns [{"content": str, "meta": dict}, ...].
+
+    Parameters
+    ----------
+    query : str
+        临床问题（中/英均可） / clinical question (cn/en ok)
+    k : int
+        返回的片段数量 / number of results to return
     """
     try:
         # 1) 获取客户端、嵌入函数与设置 / Client + embedding fn + settings
         PersistentClient, embedding_functions, Settings = _chroma()
 
-        # 关闭匿名遥测 & 在临时环境中允许 reset（可选）
-        # Disable anonymized telemetry & allow_reset in ephemeral envs
+        # 关闭匿名遥测并允许 reset（在临时/容器环境更安全）
+        # Disable anonymized telemetry & allow_reset for ephemeral environments
         client = PersistentClient(
             path=CHROMA_PERSIST_DIR,
             settings=Settings(
-                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,  # False → disable telemetry
-                allow_reset=True,                                # optional safety
+                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,  # False ⇒ disable telemetry
+                allow_reset=True,
             ),
         )
 
-        # 2) 绑定集合（若不存在则创建）/ Bind (create if missing)
+        # 2) 绑定集合（若不存在则创建）/ Bind the collection (create if missing)
         embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=EMBED_MODEL
         )
@@ -134,13 +149,56 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
 
     except Exception as e:
         # 失败时温和降级：打印日志并返回空列表（由上层决定如何回退）
-        # Soft-degrade: log & return [], letting pipeline decide a fallback.
+        # Soft-degrade: log & return [], letting pipeline decide a fallback/demo.
         print("[retriever] search_guidelines error:", e)
         return []
 
 
 # =============================================================================
-# 5) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
+# 5) 列出集合（用于诊断面板）/ List collections for diagnostics
+# -----------------------------------------------------------------------------
+def list_collections_safe() -> List[Dict[str, Any]]:
+    """
+    安全地列出 Chroma 集合名称与条目数，避免把内部对象（含 `_type`）直接序列化。
+    Safely list Chroma collections with document counts, avoiding serialization of
+    internal objects (which may include `_type` and cause UI dump errors).
+    """
+    try:
+        PersistentClient, _, Settings = _chroma()
+        client = PersistentClient(
+            path=CHROMA_PERSIST_DIR,
+            settings=Settings(
+                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
+                allow_reset=True,
+            ),
+        )
+
+        out: List[Dict[str, Any]] = []
+        for c in client.list_collections():
+            # c 可能是一个带内部元数据的对象；只提取可序列化字段
+            # `c` may carry non-serializable fields; extract only safe fields.
+            name = getattr(c, "name", None) or "?"
+            try:
+                # 一些后端支持 c.count()；如不支持则以 1 条查询作为探针
+                # Some backends support c.count(); if not, probe with 1-result query
+                count = int(c.count())
+            except Exception:
+                try:
+                    col = client.get_collection(name=name)
+                    q = col.query(query_texts=["."], n_results=1)
+                    ids = q.get("ids", [[]])[0]
+                    count = len(ids)
+                except Exception as e:
+                    count = f"error: {e}"
+            out.append({"name": name, "count": count})
+        return out
+
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# =============================================================================
+# 6) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
 # -----------------------------------------------------------------------------
 def _connect_sqlite(path: str) -> sqlite3.Connection:
     """
@@ -149,8 +207,8 @@ def _connect_sqlite(path: str) -> sqlite3.Connection:
     """
     if not os.path.exists(path):
         if DEMO:
-            # 演示模式：内存库避免崩溃（无表即无结果）
-            # Demo mode: use in-memory DB to avoid crashes (no tables → no results).
+            # 演示模式：使用内存库避免崩溃（无表即无结果）
+            # Demo mode: in-memory DB to avoid crashes (no tables ⇒ no results).
             con = sqlite3.connect(":memory:")
             con.row_factory = sqlite3.Row
             return con
@@ -165,6 +223,14 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
     """
     模糊检索药品信息（示例字段）；返回 dict 或 None。
     Fuzzy lookup of a drug (example fields); returns dict or None.
+
+    假定表结构 / Assumed schema:
+      CREATE TABLE drugs (
+          id INTEGER PRIMARY KEY,
+          name TEXT, generic_name TEXT,
+          indications TEXT, contraindications TEXT,
+          interactions TEXT, pregnancy TEXT, source TEXT
+      )
     """
     name = (drug_name or "").strip()
     if not name:
@@ -174,7 +240,7 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
     try:
         cur = con.cursor()
 
-        # 先尝试近似精确匹配 / Try near-exact first
+        # 1) 近似精确匹配 / Near-exact match first
         cur.execute(
             """
             SELECT name, generic_name, indications, contraindications,
@@ -187,7 +253,7 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
         )
         row = cur.fetchone()
 
-        # 若无命中则 LIKE 模糊 / Fallback to LIKE fuzzy
+        # 2) LIKE 模糊匹配 / Fallback to LIKE fuzzy search
         if not row:
             kw = f"%{name}%"
             cur.execute(
