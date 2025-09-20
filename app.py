@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import platform, streamlit as st
 # st.caption(f"Python version: {platform.python_version()}")
 
+import inspect
 # from rag.pipeline import answer
 import rag.pipeline as cm_pipeline # avoid direct import to prevent import-time crash on Cloud
 
@@ -227,9 +228,21 @@ if submitted:
         with st.spinner("..."):
             try:
                 t0 = time.time()
-                # res = answer(q.strip(), drug_name=(drug.strip() or None), k=int(k), lang=lang)
-                res = cm_pipeline.answer(q.strip(), drug_name=(drug.strip() or None), k=int(k), lang=lang) # avoid direct import to prevent import-time crash on Cloud; this prevents any old/duplicate answer definitions from shadowing the correct one
-                elapsed = time.time() - t0
+                sig = inspect.signature(cm_pipeline.answer).parameters
+                if "lang" in sig:  # new pipeline with language support
+                    res = cm_pipeline.answer(
+                        q.strip(),
+                        drug_name=(drug.strip() or None),
+                        k=int(k),
+                        lang=lang,
+                    )
+                else:  # older pipeline on the server (no lang parameter)
+                    res = cm_pipeline.answer(
+                        q.strip(),
+                        drug_name=(drug.strip() or None),
+                        k=int(k),
+                )
+                elapsed = time.time() - t0                    
             except Exception as e:
                 st.error(t(lang, "err_backend"))
                 tips = friendly_hints(lang, e)
