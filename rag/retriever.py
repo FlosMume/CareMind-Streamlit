@@ -9,11 +9,13 @@ retriever.py | CareMind
    Look up structured drug info in SQLite.
 
 设计要点 / Design Notes
-- Cloud 常见问题：系统自带 sqlite3 版本过旧；使用 pysqlite3-binary 作为替代。
-  Streamlit Cloud often ships an old sqlite3; we alias pysqlite3-binary to sqlite3.
-- chroma 采用“惰性导入”，避免导入阶段崩溃；只有在真正查询时才加载。
+- Cloud 常见问题：系统自带 sqlite3 版本可能过旧；使用 pysqlite3-binary 作为替代并别名到 sqlite3。
+  Streamlit Cloud may ship an old sqlite3; alias pysqlite3-binary to sqlite3 for >=3.35 features.
+- Chroma 采用“惰性导入”，避免导入阶段崩溃；只有在真正查询时才加载。
   Chroma is lazy-imported so module import never fails—only load it when needed.
-- 返回朴素字典/列表，便于 pipeline 与 UI 处理。
+- 通过 chromadb.config.Settings 关闭匿名遥测，解决 “Failed to send telemetry ClientStartEvent … get_settings” 噪声。
+  Use chromadb.config.Settings to disable telemetry (stops the ClientStartEvent/get_settings noise).
+- 返回朴素 dict/list，便于 pipeline 与 UI 处理。
   Return plain dicts/lists so pipeline/UI can compose responses easily.
 """
 
@@ -36,38 +38,59 @@ except Exception:
 
 import sqlite3  # after aliasing
 
-# Secrets-aware env reader（Secrets > env > default）
+
+# =============================================================================
+# 1) Secrets-aware env helpers / 读取配置优先 Secrets
+# -----------------------------------------------------------------------------
 def _env(key: str, default: str | None = None) -> str | None:
-    import os
+    """
+    优先从 st.secrets 读取（Cloud 上 App settings → Secrets），否则读取环境变量，最后默认值。
+    Prefer st.secrets on Cloud, then os.environ, otherwise default.
+    """
     try:
-        import streamlit as st
+        import streamlit as st  # imported lazily; safe outside Streamlit too
         return os.getenv(key, st.secrets.get(key, default))
     except Exception:
         return os.getenv(key, default)
 
-# =============================================================================
-# 1) 环境变量与默认配置 / Env vars & defaults
-# -----------------------------------------------------------------------------
-CHROMA_PERSIST_DIR: str = _env("CHROMA_PERSIST_DIR", "./chroma_store")
-CHROMA_COLLECTION: str  = _env("CHROMA_COLLECTION", "guideline_chunks")
-EMBED_MODEL: str        = _env("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-DRUG_DB_PATH: str       = _env("DRUG_DB_PATH", "./db/drugs.sqlite")
-DEMO: bool              = (_env("CAREMIND_DEMO", "1") == "1")
+def _as_bool(val: str | None, default: bool = False) -> bool:
+    """将 '1'/'true'/'True'/'yes' 等解析为布尔值 / Parse common truthy strings to bool."""
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
 
 # =============================================================================
-# 2) 惰性导入 Chroma / Lazy-import Chroma
+# 2) 环境变量与默认配置 / Env vars & defaults
+# -----------------------------------------------------------------------------
+CHROMA_PERSIST_DIR: str = _env("CHROMA_PERSIST_DIR", "./chroma_store") or "./chroma_store"
+CHROMA_COLLECTION: str  = _env("CHROMA_COLLECTION",  "guideline_chunks") or "guideline_chunks"
+EMBED_MODEL: str        = _env("EMBEDDING_MODEL",    "sentence-transformers/all-MiniLM-L6-v2") \
+                          or "sentence-transformers/all-MiniLM-L6-v2"
+DRUG_DB_PATH: str       = _env("DRUG_DB_PATH",       "./db/drugs.sqlite") or "./db/drugs.sqlite"
+DEMO: bool              = _as_bool(_env("CAREMIND_DEMO", "1"), default=True)
+
+# 允许通过 Secrets/env 覆盖是否关闭 Chroma 遥测（默认关闭）
+# Allow overriding anonymized telemetry via Secrets/env (default: off)
+CHROMA_TELEMETRY_OFF: bool = not _as_bool(_env("CHROMA_ANONYMIZED_TELEMETRY", "False"), default=False)
+
+
+# =============================================================================
+# 3) 惰性导入 Chroma / Lazy-import Chroma
 # -----------------------------------------------------------------------------
 def _chroma():
     """
-    惰性导入 Chroma；返回 (PersistentClient, embedding_functions)
-    Lazy-import chroma; return (PersistentClient, embedding_functions).
+    惰性导入 Chroma；返回 (PersistentClient, embedding_functions, Settings)
+    Lazy-import chroma; return (PersistentClient, embedding_functions, Settings).
     """
     from chromadb import PersistentClient
     from chromadb.utils import embedding_functions
-    return PersistentClient, embedding_functions
+    from chromadb.config import Settings  # 0.5.x: use Settings to configure client
+    return PersistentClient, embedding_functions, Settings
+
 
 # =============================================================================
-# 3) 指南检索（Chroma）/ Guideline search (Chroma)
+# 4) 指南检索（Chroma）/ Guideline search (Chroma)
 # -----------------------------------------------------------------------------
 def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
     """
@@ -75,9 +98,18 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
     Semantic search via Chroma; returns [{"content": str, "meta": dict}, ...]
     """
     try:
-        # 1) 获取客户端与嵌入函数 / Client + embedding function
-        PersistentClient, embedding_functions = _chroma()
-        client = PersistentClient(path=CHROMA_PERSIST_DIR)
+        # 1) 获取客户端、嵌入函数与设置 / Client + embedding fn + settings
+        PersistentClient, embedding_functions, Settings = _chroma()
+
+        # 关闭匿名遥测 & 在临时环境中允许 reset（可选）
+        # Disable anonymized telemetry & allow_reset in ephemeral envs
+        client = PersistentClient(
+            path=CHROMA_PERSIST_DIR,
+            settings=Settings(
+                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,  # False → disable telemetry
+                allow_reset=True,                                # optional safety
+            ),
+        )
 
         # 2) 绑定集合（若不存在则创建）/ Bind (create if missing)
         embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
@@ -106,8 +138,9 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
         print("[retriever] search_guidelines error:", e)
         return []
 
+
 # =============================================================================
-# 4) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
+# 5) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
 # -----------------------------------------------------------------------------
 def _connect_sqlite(path: str) -> sqlite3.Connection:
     """
@@ -116,13 +149,17 @@ def _connect_sqlite(path: str) -> sqlite3.Connection:
     """
     if not os.path.exists(path):
         if DEMO:
-            con = sqlite3.connect(":memory:")  # 演示模式：用内存库避免崩溃 / demo tolerance
+            # 演示模式：内存库避免崩溃（无表即无结果）
+            # Demo mode: use in-memory DB to avoid crashes (no tables → no results).
+            con = sqlite3.connect(":memory:")
             con.row_factory = sqlite3.Row
             return con
         raise FileNotFoundError(f"SQLite DB not found: {path}")
+
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     return con
+
 
 def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
     """
