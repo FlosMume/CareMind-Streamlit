@@ -9,7 +9,7 @@ import json, re, time
 from typing import Any, Dict, List, Optional
 
 import platform, streamlit as st
-st.caption(f"Python version: {platform.python_version()}")
+# st.caption(f"Python version: {platform.python_version()}")
 
 from rag.pipeline import answer  # backend entry
 
