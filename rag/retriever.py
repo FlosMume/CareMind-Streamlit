@@ -39,17 +39,29 @@ except Exception:
 
 import sqlite3  # after aliasing
 
+def _env(key: str, default: str | None = None) -> str | None:
+    import os
+    try:
+        import streamlit as st
+        return os.getenv(key, st.secrets.get(key, default))  # read Secrets if present
+    except Exception:
+        return os.getenv(key, default)
+
 
 # =============================================================================
 # 1) 环境变量与默认配置 / Env vars & defaults
 # -----------------------------------------------------------------------------
-CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-CHROMA_COLLECTION: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
-EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+# CHROMA_COLLECTION: str = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
+# EMBED_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+# DRUG_DB_PATH: str = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")
+# DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"  # 云端默认演示模式 ON / demo ON by default on Cloud
 
-DRUG_DB_PATH: str = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")
-DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"  # 云端默认演示模式 ON / demo ON by default on Cloud
-
+CHROMA_PERSIST_DIR: str = _env("CHROMA_PERSIST_DIR", "./chroma_store")
+CHROMA_COLLECTION: str = _env("CHROMA_COLLECTION", "guideline_chunks")
+EMBED_MODEL: str = _env("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+DRUG_DB_PATH: str = _env("DRUG_DB_PATH", "./db/drugs.sqlite")
+DEMO: bool = (_env("CAREMIND_DEMO", "1") == "1")  # 云端默认演示模式 ON / demo ON by default on Cloud
 
 # =============================================================================
 # 2) 惰性导入 Chroma / Lazy-import Chroma

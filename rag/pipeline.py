@@ -30,11 +30,22 @@ import traceback
 from . import retriever as R
 from .prompt import SYSTEM, USER_TEMPLATE  # keep your existing prompt templates
 
+def _env(key: str, default: str | None = None) -> str | None:
+    import os
+    try:
+        import streamlit as st
+        return os.getenv(key, st.secrets.get(key, default))  # read Secrets if present
+    except Exception:
+        return os.getenv(key, default)
+
 # -----------------------------------------------------------------------------
 # Config flags
 # -----------------------------------------------------------------------------
-DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"   # default ON for Cloud
-MAX_K: int = int(os.getenv("CAREMIND_MAX_K", "8"))
+# DEMO: bool = os.getenv("CAREMIND_DEMO", "1") == "1"   # default ON for Cloud
+# MAX_K: int = int(os.getenv("CAREMIND_MAX_K", "8"))
+
+DEMO: bool = (_env("CAREMIND_DEMO", "1") == "1")   # default ON for Cloud
+MAX_K: int = int(_env("CAREMIND_MAX_K", "8"))
 
 # -----------------------------------------------------------------------------
 # Lightweight data model
