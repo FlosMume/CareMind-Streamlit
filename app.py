@@ -2,38 +2,38 @@
 """
 CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 ------------------------------------------------
-- Streamlit UI (simplified, responsive)
-- Bilingual labels (中文/English)
-- Reflective call into rag.pipeline.answer (tolerates old/new signatures)
-- NEW: Diagnostics expander to inspect runtime env & data availability
-
-Notes
------
-1) We import the pipeline as a module (not "from x import y") to avoid
-   hot-reload/import shadowing issues on Streamlit Cloud.
-2) Diagnostics reads both os.environ and st.secrets via `_env()` helper.
-3) No Python-version banner is shown (kept for privacy/clean UI).
+特性 / Features
+- 双语 UI（中文 / English）
+- 通过 rag.pipeline.answer 提供建议文本（反射式调用，兼容是否含 lang 参数）
+- 证据片段/药品结构化/运行日志 Tab
+- ✅ 诊断面板：展示有效配置（Secrets 优先）、chroma_store 是否存在、
+  Chroma 集合与条目数（调用 retriever.list_collections_safe 防止 `_type` 报错）、
+  SQLite 文件是否存在与表清单
+- 不显示 Python 版本信息
 """
 
 from __future__ import annotations
 
-import json, re, time, inspect, pathlib, contextlib
+import os
+import re
+import json
+import time
+import inspect
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
-import rag.pipeline as cm_pipeline  # module import to avoid symbol shadowing on Cloud
+import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
+from rag import retriever as R              # 供诊断面板使用（读取常量 + 安全列集合）
 
 
 # =============================================================================
-# 0) Tiny helpers
+# 0) 辅助函数 / Helpers
 # -----------------------------------------------------------------------------
 def _env(key: str, default: str | None = None) -> str | None:
     """
     Secrets-aware env reader:
-    Prefer st.secrets[key] if present, otherwise os.environ[key], otherwise default.
-    在 Cloud 上优先读取 Secrets（App settings → Secrets），再读环境变量，最后默认值。
+    优先 st.secrets[key]，其后 os.environ[key]，最后 default。
     """
-    import os
     try:
         return os.getenv(key, st.secrets.get(key, default))
     except Exception:
@@ -41,15 +41,13 @@ def _env(key: str, default: str | None = None) -> str | None:
 
 def link_citations(md: str) -> str:
     """
-    Convert "[#3]" style references to in-page anchors "#hit-3" for evidence expander.
-    将 "[#3]" 转为页面锚点 "#hit-3"，便于点回对应证据片段。
+    将 "[#3]" 或 "[3]" 转为页面锚点 "#hit-3"，便于从建议跳回证据片段。
     """
     return re.sub(r"\[(?:#)?(\d+)\]", r"[\1](#hit-\1)", md or "")
 
 def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
     """
-    Render selected evidence snippets into Markdown, for export/download.
-    将证据片段渲染为 Markdown，用于导出。
+    将证据片段渲染为 Markdown（用于下载）。
     """
     lines = []
     for i, h in enumerate(hits or [], 1):
@@ -57,33 +55,33 @@ def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
         title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
         source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
         year   = str(m.get("year")   or "—")
-        if lang == "zh":
-            lines.append(f"### #{i} {title}\n\n- 来源：{source} · 年份：{year}\n\n{h.get('content','')}\n")
-        else:
-            lines.append(f"### #{i} {title}\n\n- Source: {source} · Year: {year}\n\n{h.get('content','')}\n")
+        head = f"### #{i} {title}\n\n" + (f"- 来源：{source} · 年份：{year}\n\n" if lang=="zh"
+                                          else f"- Source: {source} · Year: {year}\n\n")
+        lines.append(head + (h.get("content") or "") + "\n")
     return "\n".join(lines)
 
 def friendly_hints(lang: str, exc: Exception) -> List[str]:
-    """
-    Convert common backend error patterns into friendly hints.
-    将常见后端错误提示转为可读的引导。
-    """
+    """把常见后端异常翻译成友好的排障提示。"""
     msg = str(exc).lower()
     zh = (lang == "zh")
     tips = []
     if "chromadb" in msg:
-        tips.append("· 检查 CHROMA_PERSIST_DIR / CHROMA_COLLECTION" if zh else "· Check CHROMA_PERSIST_DIR / CHROMA_COLLECTION")
+        tips.append("· 检查 CHROMA_PERSIST_DIR / CHROMA_COLLECTION" if zh else
+                    "· Check CHROMA_PERSIST_DIR / CHROMA_COLLECTION")
     if "sqlite" in msg:
-        tips.append("· 检查 SQLite 路径与表结构" if zh else "· Verify SQLite path & schema")
+        tips.append("· 检查 SQLite 路径与表结构" if zh else
+                    "· Verify SQLite path & schema")
     if "cuda" in msg or "cudnn" in msg:
-        tips.append("· 检查 CUDA/cuDNN 或切到 CPU" if zh else "· Check CUDA/cuDNN or switch to CPU")
+        tips.append("· 检查 CUDA/cuDNN 或切到 CPU" if zh else
+                    "· Check CUDA/cuDNN or switch to CPU")
     if "module" in msg and "not found" in msg:
-        tips.append("· 确认 rag/__init__.py 与导入路径" if zh else "· Ensure rag/__init__.py and import path")
+        tips.append("· 确认 rag/__init__.py 与导入路径" if zh else
+                    "· Ensure rag/__init__.py and import path")
     return tips
 
 
 # =============================================================================
-# 1) i18n text (UI chrome only; pipeline content localized in backend)
+# 1) 极简 i18n（页面文案；pipeline 内部生成的文本已在后端本地化）
 # -----------------------------------------------------------------------------
 I18N: Dict[str, Dict[str, str]] = {
     "zh": {
@@ -194,11 +192,10 @@ def t(lang: str, key: str) -> str:
 
 
 # =============================================================================
-# 2) Page config + CSS
+# 2) 页面配置 & 轻量样式
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="CareMind · MVP CDSS", layout="wide", page_icon="💊")
-
-CSS = """
+st.markdown("""
 <style>
 .cm-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;background:#eef2ff;border:1px solid #c7d2fe;margin-right:6px;white-space:nowrap;}
 .cm-chip{display:inline-block;padding:2px 8px;border-radius:8px;font-size:12px;background:#f1f5f9;border:1px solid #e2e8f0;margin:0 6px 6px 0;}
@@ -207,32 +204,27 @@ CSS = """
 .cm-card{border:1px solid #e5e7eb;background:#fff;border-radius:12px;padding:12px 14px;margin-bottom:10px;}
 footer{visibility:hidden;}
 </style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 
 # =============================================================================
-# 3) Sidebar controls
+# 3) 侧边栏
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    # Language selector
     lang = st.selectbox("Language / 语言", options=["zh", "en"], index=0,
                         format_func=lambda x: "中文" if x == "zh" else "English")
     st.header(t(lang, "settings"))
 
-    # Retrieval configuration
     k = st.slider(t(lang, "k_slider"), min_value=2, max_value=8, value=4, step=1)
     show_meta = st.toggle(t(lang, "show_meta"), value=True)
     expand_hits = st.toggle(t(lang, "expand_hits"), value=False)
 
-    # Filters
     st.divider()
     st.markdown(f"#### {t(lang, 'filters')}")
     src_filter = st.text_input(t(lang, "filter_src"))
     year_min, year_max = st.slider(t(lang, "filter_year"), 2000, 2035, (2005, 2035))
     st.divider()
 
-    # Presets (language-aware)
     st.markdown(f"#### {t(lang, 'presets')}")
     presets = {
         "zh": {
@@ -250,14 +242,12 @@ with st.sidebar:
     preset_choice = st.selectbox(t(lang, "preset_select"),
                                  options=[preset_none] + list(presets[lang].keys()),
                                  index=0)
-    st.caption(t(lang, "page_footer"))
 
 
 # =============================================================================
-# 4) Input area
+# 4) 输入区
 # -----------------------------------------------------------------------------
 st.title(t(lang, "title"))
-
 with st.form("cm_query"):
     q_init = presets[lang].get(preset_choice, "") if preset_choice != preset_none else ""
     q = st.text_input(t(lang, "question_label"),
@@ -268,7 +258,7 @@ with st.form("cm_query"):
 
 
 # =============================================================================
-# 5) Tabs
+# 5) 结果页签
 # -----------------------------------------------------------------------------
 tab_adv, tab_hits, tab_drug, tab_log = st.tabs([
     t(lang, "tab_advice"),
@@ -282,7 +272,7 @@ elapsed: Optional[float] = None
 
 
 # =============================================================================
-# 6) Backend invocation (reflective; supports old/new pipeline)
+# 6) 调用后端（反射式，兼容是否含 lang 参数）
 # -----------------------------------------------------------------------------
 if submitted:
     if not (q and q.strip()):
@@ -291,21 +281,14 @@ if submitted:
         with st.spinner("..."):
             try:
                 t0 = time.time()
-                # Check whether pipeline.answer has a 'lang' parameter
                 sig_params = inspect.signature(cm_pipeline.answer).parameters
                 if "lang" in sig_params:
                     res = cm_pipeline.answer(
-                        q.strip(),
-                        drug_name=(drug.strip() or None),
-                        k=int(k),
-                        lang=lang,
+                        q.strip(), drug_name=(drug.strip() or None), k=int(k), lang=lang
                     )
                 else:
-                    # Backward compatibility: call without lang
                     res = cm_pipeline.answer(
-                        q.strip(),
-                        drug_name=(drug.strip() or None),
-                        k=int(k),
+                        q.strip(), drug_name=(drug.strip() or None), k=int(k)
                     )
                 elapsed = time.time() - t0
             except Exception as e:
@@ -318,10 +301,10 @@ if submitted:
 
 
 # =============================================================================
-# 7) Render results
+# 7) 渲染结果
 # -----------------------------------------------------------------------------
 if res:
-    # --- Advice tab ---
+    # --- 建议 ---
     with tab_adv:
         st.subheader(t(lang, "advice_hdr"))
         output_text = link_citations(res.get("output") or "")
@@ -348,7 +331,7 @@ if res:
             )
         st.caption(t(lang, "disclaimer"))
 
-    # --- Evidence tab ---
+    # --- 证据片段 ---
     with tab_hits:
         hits: List[Dict[str, Any]] = res.get("guideline_hits") or []
 
@@ -367,16 +350,16 @@ if res:
         if not hits:
             st.info(t(lang, "no_hits"))
         else:
-            # Source chips
+            # 来源 chip
             counts: Dict[str, int] = {}
             for h in hits:
                 m = h.get("meta") or {}
                 s = str(m.get("source") or ("未知来源" if lang == "zh" else "Unknown")).strip()
                 counts[s] = counts.get(s, 0) + 1
-            st.markdown(" ".join([f"<span class='cm-chip'>{s} × {n}</span>" for s, n in counts.items()]),
-                        unsafe_allow_html=True)
+            st.markdown(" ".join(
+                [f"<span class='cm-chip'>{s} × {n}</span>" for s, n in counts.items()]
+            ), unsafe_allow_html=True)
 
-            # Snippets
             for i, h in enumerate(hits, 1):
                 m = h.get("meta") or {}
                 title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
@@ -385,7 +368,7 @@ if res:
                 doc_id = str(m.get("id")     or "—")
                 label = f"#{i} · {title[:60]}"
                 st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
-                with st.expander(label, expanded=expand_hits):
+                with st.expander(label, expanded=False):
                     if show_meta:
                         st.markdown(
                             f"<div class='cm-muted'>"
@@ -397,7 +380,7 @@ if res:
                         )
                     st.markdown(h.get("content") or ("（空片段）" if lang == "zh" else "(empty)"))
 
-    # --- Drug tab ---
+    # --- 药品结构化 ---
     with tab_drug:
         st.subheader(t(lang, "drug_hdr"))
         if res.get("drug"):
@@ -405,7 +388,7 @@ if res:
         else:
             st.caption(t(lang, "no_drug"))
 
-    # --- Logs tab ---
+    # --- 运行日志 ---
     with tab_log:
         log = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -427,79 +410,54 @@ if res:
 
 
 # =============================================================================
-# 8) Diagnostics expander (always available)
+# 8) 诊断面板（始终可见；使用 retriever.list_collections_safe）
 # -----------------------------------------------------------------------------
 def render_diagnostics(lang: str = "zh") -> None:
-    """
-    Runtime diagnostics: show effective env (incl. Secrets), Chroma dir status,
-    collections & counts, and SQLite availability. Best-effort & non-fatal.
-    运行时诊断：显示有效配置（包含 Secrets）、Chroma 目录与集合统计、SQLite 可用性。
-    """
     title = t(lang, "diag_title")
     with st.expander(title, expanded=False):
-        # ---- Effective config (Secrets-first) ----
-        keys = ["CAREMIND_DEMO", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION", "EMBEDDING_MODEL", "DRUG_DB_PATH"]
+        # 有效配置（Secrets 优先）
+        keys = ["CAREMIND_DEMO", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION",
+                "EMBEDDING_MODEL", "DRUG_DB_PATH"]
         eff = {k: _env(k, None) for k in keys}
         st.write(t(lang, "diag_cfg"))
         st.code(json.dumps(eff, ensure_ascii=False, indent=2))
 
-        # ---- Chroma directory existence ----
+        # Chroma 目录存在性
         chroma_dir = eff.get("CHROMA_PERSIST_DIR") or "./chroma_store"
-        chroma_path = pathlib.Path(chroma_dir)
-        st.write(
-            (f"Chroma 目录存在：{chroma_path.resolve()} → {chroma_path.exists()}")
-            if lang == "zh"
-            else (f"Chroma dir exists: {chroma_path.resolve()} → {chroma_path.exists()}")
-        )
+        abs_chroma = os.path.abspath(chroma_dir)
+        st.write(f"{'Chroma 目录存在：' if lang=='zh' else 'Chroma dir exists:'} "
+                 f"{abs_chroma} → {os.path.exists(abs_chroma)}")
 
-        # ---- Chroma collections & counts ----
+        # 集合与条数（安全方式；避免 _type）
         try:
-            from chromadb import PersistentClient
-            pc = PersistentClient(path=str(chroma_path))
-            rows = []
-            for c in pc.list_collections():
-                try:
-                    col = pc.get_collection(name=c.name)
-                    # Some backends may not support .count(); probe with a 1-result query
-                    with contextlib.suppress(Exception):
-                        n = int(col.count())
-                        rows.append({"name": c.name, "count": n})
-                        continue
-                    q = col.query(query_texts=["."], n_results=1)
-                    ids = q.get("ids", [[]])[0]
-                    rows.append({"name": c.name, "count": len(ids)})
-                except Exception as e:
-                    rows.append({"name": c.name, "error": str(e)})
+            cols = R.list_collections_safe()
             st.write(t(lang, "diag_chroma"))
-            st.code(json.dumps(rows, ensure_ascii=False, indent=2))
+            st.json(cols)
         except Exception as e:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
-        # ---- SQLite DB presence & tables ----
+        # SQLite 存在性与表
         db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
-        dbp = pathlib.Path(db_path)
-        st.write(
-            (f"SQLite 文件存在：{dbp.resolve()} → {dbp.exists()}")
-            if lang == "zh"
-            else (f"SQLite file exists: {dbp.resolve()} → {dbp.exists()}")
-        )
+        abs_db = os.path.abspath(db_path)
+        st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
+                 f"{abs_db} → {os.path.exists(abs_db)}")
         try:
             import sqlite3
-            con = sqlite3.connect(str(dbp))
+            con = sqlite3.connect(abs_db)
             cur = con.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = [r[0] for r in cur.fetchall()]
             con.close()
             st.write(t(lang, "diag_sqlite"))
-            st.code(json.dumps(tables, ensure_ascii=False))
+            st.json(tables)
         except Exception as e:
             st.warning(t(lang, "diag_sqlite_err") + str(e))
 
-# Render diagnostics panel at the bottom of the page
+# 页面底部渲染诊断
 render_diagnostics(lang)
 
 
 # =============================================================================
-# 9) Footer
+# 9) 页脚
 # -----------------------------------------------------------------------------
 st.caption(t(lang, "page_footer"))
