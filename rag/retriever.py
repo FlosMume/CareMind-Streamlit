@@ -199,6 +199,60 @@ def get_chroma_collection():
         _log("Collection opened after migrate+retry.")
         return _collection
 
+# ---- version tag（给诊断面板用，可选）----
+__RETRIEVER_VERSION__ = "retriever-2025-09-21b"
+
+def retriever_version() -> str:
+    """返回检索器版本号（供诊断卡片显示）。"""
+    return __RETRIEVER_VERSION__
+
+
+# ---- 列出现有 Chroma 集合，安全兜底 ----
+from typing import TypedDict
+
+class _ColInfo(TypedDict, total=False):
+    id: str
+    name: str
+    count: int
+    metadata: dict
+
+def list_collections_safe() -> List[_ColInfo]:
+    """
+    安全地列出当前 PERSIST_DIR 下的 Chroma 集合。
+    - 任何异常都会被捕获并打印日志，返回空列表，而不会让前端崩。
+    - 仅依赖 get_chroma_client()，兼容 Chroma 0.5.x。
+    """
+    infos: List[_ColInfo] = []
+    try:
+        client = get_chroma_client()
+        cols = client.list_collections()  # 0.5.x API
+        for c in cols:
+            # c 有 name/id；count 需要一次轻量查询（可能较慢，做 try/except）
+            info: _ColInfo = {
+                "id": getattr(c, "id", None),
+                "name": getattr(c, "name", None),
+                "metadata": getattr(c, "metadata", {}) or {},
+            }
+            try:
+                # 取前 1 条仅为统计 count，不取 embeddings
+                q = c.get()  # 有些版本支持 c.count()；没有的话用 get()
+                # 如果支持 count():
+                if hasattr(c, "count"):
+                    info["count"] = int(c.count())
+                else:
+                    # 退化：用 get() 的返回长度估计（可能为全量，视后端实现）
+                    ids = (q.get("ids") or [])
+                    info["count"] = sum(len(x) for x in ids) if ids and isinstance(ids[0], list) else len(ids)
+            except Exception:
+                # 统计失败不阻塞
+                pass
+            infos.append(info)
+    except Exception as e:
+        _log("list_collections_safe error:", repr(e))
+        return []
+    return infos
+
+
 
 
 # ---------------------------
