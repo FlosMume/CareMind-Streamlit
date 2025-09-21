@@ -125,7 +125,9 @@ _collection = None
 def get_chroma_client():
     """
     新式客户端：PersistentClient(path=...)。
-    不再使用旧 Settings 键，避免“deprecated configuration”。
+    创建后立刻做一次“预检”：list_collections()
+    ——若此处就因旧配置报错（含 KeyError('_type')/deprecated/config 冲突），
+      立即隔离目录并重建客户端，确保后续安全。
     """
     global _chroma_client
     if _chroma_client is not None:
@@ -133,7 +135,7 @@ def get_chroma_client():
 
     os.makedirs(PERSIST_DIR, exist_ok=True)
 
-    # 清除一些遗留旧式环境键，避免被误判为 legacy 配置
+    # 清理遗留旧式环境键，避免被误判为 legacy 配置
     for k in [
         "CHROMA_DB_IMPL",
         "CHROMA_PERSIST_DIRECTORY",
@@ -147,21 +149,34 @@ def get_chroma_client():
     from chromadb import PersistentClient
     from chromadb.config import Settings
 
-    # 仅保留“安全”的设置：关闭匿名遥测
     settings = Settings(anonymized_telemetry=False)
-
     _chroma_client = PersistentClient(path=PERSIST_DIR, settings=settings)
+
+    # —— 关键预检：任何异常都视为“旧/损坏存储”，先隔离再重建 ——
+    try:
+        _ = _chroma_client.list_collections()
+    except Exception as e:
+        msg = repr(e)
+        if ("'_type'" in msg) or ("deprecated configuration" in msg.lower()) or ("already exists for" in msg) or ("configuration" in msg.lower()):
+            _log("Preflight detected legacy/broken store; quarantining and rebuilding client...")
+            _quarantine_persist_dir(PERSIST_DIR)
+            _chroma_client = PersistentClient(path=PERSIST_DIR, settings=settings)
+        else:
+            # 不确定类型的异常，仍然隔离一次以最大化成功率
+            _log("Preflight error; quarantining as a safeguard...", msg)
+            _quarantine_persist_dir(PERSIST_DIR)
+            _chroma_client = PersistentClient(path=PERSIST_DIR, settings=settings)
 
     _log("Chroma version:", getattr(chromadb, "__version__", "unknown"))
     _log("CHROMA_PERSIST_DIR:", PERSIST_DIR)
     _log("CHROMA_COLLECTION:", COLLECTION_NAME)
     return _chroma_client
 
+
 def get_chroma_collection():
     """
     获取（或创建）指定集合。
-    - 若触发与旧库相关的异常（'_type' / deprecated / settings 冲突等）：
-      隔离旧目录 -> 重建客户端 -> 再试一次。
+    - 若创建失败（任意异常），隔离旧目录 -> 重建客户端 -> 再试一次。
     """
     global _collection, _chroma_client
     if _collection is not None:
@@ -175,18 +190,14 @@ def get_chroma_collection():
         _collection = client.get_or_create_collection(name=target, embedding_function=embed_fn)
         return _collection
     except Exception as e:
-        msg = repr(e)
-        if ("'_type'" in msg) or ("deprecated configuration" in msg.lower()) or ("already exists for" in msg):
-            _log("Detected legacy/broken Chroma store; quarantining and retrying once...")
-            _quarantine_persist_dir(PERSIST_DIR)
-            # 重新创建 client + collection
-            _chroma_client = None
-            client = get_chroma_client()
-            _collection = client.get_or_create_collection(name=target, embedding_function=embed_fn)
-            _log("Collection opened after quarantine+rebuild.")
-            return _collection
-        # 其它异常直接抛出，便于上层日志捕获
-        raise
+        _log("get_or_create_collection failed; quarantining and retrying once...", repr(e))
+        _quarantine_persist_dir(PERSIST_DIR)
+        _chroma_client = None
+        client = get_chroma_client()
+        _collection = client.get_or_create_collection(name=target, embedding_function=embed_fn)
+        _log("Collection opened after quarantine+rebuild.")
+        return _collection
+
 
 # ---------------------------
 # 指南向量检索
