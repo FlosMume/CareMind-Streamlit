@@ -147,30 +147,43 @@ def get_chroma_client():
     _chroma_client = PersistentClient(path=PERSIST_DIR)
     return _chroma_client
 
-def get_chroma_collection():
-    """
-    获取（或创建）指定集合；
-    - 失败时（不论异常类型），再次全库迁移并重试一次。
-    """
-    global _collection
-    if _collection is not None:
-        return _collection
+def get_chroma_client():
+    """创建 Chroma Client（带全库预迁移 & 显式 Settings，一次且仅一次）。"""
+    global _chroma_client
+    if _chroma_client is not None:
+        return _chroma_client
 
-    client = get_chroma_client()
-    embed_fn = _ChromaEmbedFn(_EMBED)
-    target = COLLECTION_NAME
+    # 目录与预迁移
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+    _migrate_all_collections(PERSIST_DIR)
 
-    try:
-        _collection = client.get_or_create_collection(name=target, embedding_function=embed_fn)
-        return _collection
-    except Exception as e:
-        _log("get_or_create_collection error (first try):", repr(e))
-        _log("Retry after migrating all collections...")
-        _migrate_all_collections(PERSIST_DIR)
-        # 再试一次
-        _collection = client.get_or_create_collection(name=target, embedding_function=embed_fn)
-        _log("Collection opened after migrate+retry.")
-        return _collection
+    # 显式、稳定的 Settings —— 确保与进程内其他地方完全一致
+    import chromadb
+    from chromadb.config import Settings
+
+    # 有些托管环境把 CHROMA_ANONYMIZED_TELEMETRY 默认为 true，
+    # 我们强制为 false，以避免与之前已创建的实例设置不一致
+    settings = Settings(
+        chroma_db_impl="duckdb+parquet",   # 0.5.x 的持久化默认实现
+        is_persistent=True,
+        persist_directory=PERSIST_DIR,
+        anonymized_telemetry=False,
+        allow_reset=False,                 # 保守：不允许 reset（可按需改 True）
+    )
+
+    # 统一用 Client(settings)（避免不同入口用 PersistentClient(path=...) 时引入隐式差异）
+    _chroma_client = chromadb.Client(settings)
+
+    _log("Chroma version:", getattr(chromadb, "__version__", "unknown"))
+    _log("CHROMA_PERSIST_DIR:", PERSIST_DIR)
+    _log("CHROMA_COLLECTION:", COLLECTION_NAME)
+    _log("Chroma settings:", {
+        "chroma_db_impl": "duckdb+parquet",
+        "is_persistent": True,
+        "anonymized_telemetry": False,
+    })
+    return _chroma_client
+
 
 # ---------------------------
 # 指南向量检索
