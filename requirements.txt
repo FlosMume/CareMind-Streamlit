@@ -11,5 +11,3 @@ sentence-transformers>=2.6.1
 
 # 关键：在 Streamlit Cloud 上提供 SQLite 动态库
 pysqlite3-binary==0.5.4
-
-CHROMA_ANONYMIZED_TELEMETRY=false # 有的平台会注入 true，导致“已有实例设置≠当前设置”的冲突
