@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-（原始长版）CareMind Streamlit 前端
+CareMind · MVP CDSS (Streamlit, bilingual zh/en)
+------------------------------------------------
+特性 / Features
 - 双语 UI（中文 / English）
-- 通过 rag.pipeline.answer 提供建议（反射式，兼容是否含 lang 参数）
+- 通过 rag.pipeline.answer 提供建议文本（反射式调用，兼容是否含 lang 参数）
 - 证据片段/药品结构化/运行日志 Tab
 - ✅ 诊断面板：展示有效配置（Secrets 优先）、chroma_store 是否存在、
   Chroma 集合与条目数（调用 retriever.list_collections_safe 防止 `_type` 报错）、
@@ -158,10 +160,11 @@ k = st.sidebar.slider(t(lang, "k_slider"), min_value=1, max_value=10, value=4, s
 show_meta = st.sidebar.checkbox(t(lang, "show_meta"), value=False)
 expand_hits = st.sidebar.checkbox(t(lang, "expand_hits"), value=False)
 
-# ...（中间保留你原始全部 UI / 逻辑，这里略）...
+# 这里是你原始的 UI/逻辑区域（保持原样）……
+# （为了篇幅，这里省略你原本的业务区块；请直接用你仓库里的那一段）
 
 # =============================================================================
-# 8) 诊断面板（始终可见；使用 retriever.list_collections_safe）
+# 8) 诊断面板（使用 retriever.list_collections_safe）
 # -----------------------------------------------------------------------------
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
@@ -172,7 +175,7 @@ def render_diagnostics(lang: str = "zh") -> None:
         eff = {k: _env(k, None) for k in keys}
         st.write(t(lang, "diag_cfg"))
         st.code(json.dumps(eff, ensure_ascii=False, indent=2))
-        # —— 最小补丁（很小）：显示 retriever 版本号，确认云端是否更新到位 ——
+        # ✅ 最小补丁：显示 retriever 版本号，确认云端是否更新到位
         st.write("Retriever version:", getattr(R, "VERSION", "unknown"))
 
         # Chroma 目录存在性
@@ -189,17 +192,18 @@ def render_diagnostics(lang: str = "zh") -> None:
         except Exception as e:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
-        # SQLite 表
+        # SQLite 存在性与表
+        db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
+        abs_db = os.path.abspath(db_path)
+        st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
+                 f"{abs_db} → {os.path.exists(abs_db)}")
         try:
             import sqlite3
-            db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
-            tables = []
-            if os.path.exists(db_path):
-                con = sqlite3.connect(db_path)
-                cur = con.cursor()
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                tables = [r[0] for r in cur.fetchall()]
-                con.close()
+            con = sqlite3.connect(abs_db)
+            cur = con.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall()]
+            con.close()
             st.write(t(lang, "diag_sqlite"))
             st.json(tables)
         except Exception as e:
