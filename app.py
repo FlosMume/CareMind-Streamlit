@@ -9,6 +9,7 @@ CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 - ✅ 诊断面板：展示有效配置（Secrets 优先）、chroma_store 是否存在、
   Chroma 集合与条目数（调用 retriever.list_collections_safe 防止 `_type` 报错）、
   SQLite 文件是否存在与表清单
+- ✅ 新增：本会话历史记录与“一键复用”
 - 不显示 Python 版本信息
 """
 
@@ -156,7 +157,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "preset_select": "Quick pick",
         "preset_none": "——",
         "preset1": "Monitoring ACEI/ARB in CKD + Hypertension",
-        "preset2": "Elderly with T2DM+CAD: target BP and therapy",
+        "preset2": "Elderly with T2DM+CAD: target BP and first-line therapy",
         "preset3": "GDM: when to start insulin",
         "advice_hdr": "Advice (with citations & compliance note)",
         "time_used": "⏱️ Elapsed: {:.2f}s",
@@ -243,17 +244,32 @@ with st.sidebar:
                                  options=[preset_none] + list(presets[lang].keys()),
                                  index=0)
 
+    # 会话历史（侧边栏显示概览）
+    st.markdown(f"#### {t(lang, 'history_hdr')}")
+    hist = st.session_state.setdefault("cm_history", [])
+    if not hist:
+        st.caption(t(lang, "no_history"))
+    else:
+        for idx, h in enumerate(reversed(hist[-8:]), 1):
+            st.write(f"{idx}. {h.get('q')[:36]}{'...' if len(h.get('q'))>36 else ''}")
+            if st.button(t(lang, "reuse"), key=f"reuse_side_{idx}"):
+                st.session_state["prefill"] = h
 
 # =============================================================================
 # 4) 输入区
 # -----------------------------------------------------------------------------
 st.title(t(lang, "title"))
 with st.form("cm_query"):
-    q_init = presets[lang].get(preset_choice, "") if preset_choice != preset_none else ""
+    prefill = st.session_state.pop("prefill", None)
+    q_init = (prefill or {}).get("q") or (presets[lang].get(preset_choice, "") if preset_choice != preset_none else "")
+    k_pref = (prefill or {}).get("k")
+    if k_pref is not None:
+        k = int(k_pref)
+
     q = st.text_input(t(lang, "question_label"),
                       placeholder=t(lang, "question_ph"),
                       value=q_init)
-    drug = st.text_input(t(lang, "drug_label"), value="")
+    drug = st.text_input(t(lang, "drug_label"), value=(prefill or {}).get("drug", ""))
     submitted = st.form_submit_button(t(lang, "submit"), use_container_width=True)
 
 
@@ -291,6 +307,11 @@ if submitted:
                         q.strip(), drug_name=(drug.strip() or None), k=int(k)
                     )
                 elapsed = time.time() - t0
+
+                # 记录到会话历史
+                st.session_state.setdefault("cm_history", []).append(
+                    {"q": q.strip(), "drug": (drug.strip() or None), "k": int(k), "time": time.time()}
+                )
             except Exception as e:
                 st.error(t(lang, "err_backend"))
                 hints = friendly_hints(lang, e)
@@ -350,7 +371,6 @@ if res:
         if not hits:
             st.info(t(lang, "no_hits"))
         else:
-            # 来源 chip
             counts: Dict[str, int] = {}
             for h in hits:
                 m = h.get("meta") or {}
@@ -368,7 +388,7 @@ if res:
                 doc_id = str(m.get("id")     or "—")
                 label = f"#{i} · {title[:60]}"
                 st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
-                with st.expander(label, expanded=False):
+                with st.expander(label, expanded=bool(expand_hits)):
                     if show_meta:
                         st.markdown(
                             f"<div class='cm-muted'>"
@@ -421,7 +441,7 @@ def render_diagnostics(lang: str = "zh") -> None:
         eff = {k: _env(k, None) for k in keys}
         st.write(t(lang, "diag_cfg"))
         st.code(json.dumps(eff, ensure_ascii=False, indent=2))
-        # ✅ 最小补丁：显示 retriever 版本号，确认云端是否更新到位
+        # ✅ 显示 retriever 版本号，确认云端是否更新到位
         st.write("Retriever version:", getattr(R, "VERSION", "unknown"))
 
         # Chroma 目录存在性

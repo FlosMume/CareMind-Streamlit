@@ -19,6 +19,8 @@ retriever.py | CareMind
   Secrets-first config via _env() (Secrets → env → default).
 - ✅ 安全的集合枚举：list_collections_safe() 仅返回 {name, count}，避免 _type 等序列化问题。
   Safe collection listing that avoids serializing Chroma internals like `_type`.
+- ✅ 连接/集合缓存：get_chroma_client / get_chroma_collection 做简单缓存，减少反复打开。
+  Simple in-process cache for client/collection.
 """
 
 from __future__ import annotations
@@ -28,15 +30,17 @@ import sys
 from typing import Any, Dict, List, Optional
 
 # 模块版本号（用于诊断显示云端是否更新）
-VERSION = "retriever-2025-09-21a"
+VERSION = "retriever-2025-09-21b"
 
 # =============================================================================
 # 0) SQLite 兼容补丁（Cloud）/ SQLite compatibility shim (Cloud)
 # -----------------------------------------------------------------------------
+# 优先使用 pysqlite3-binary，避免云端缺失 _sqlite3 动态库导致 Chroma 初始化失败
 try:
     import pysqlite3  # type: ignore
     sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 except Exception:
+    # 本地通常自带 sqlite3，忽略即可
     pass
 
 import sqlite3  # after aliasing
@@ -71,37 +75,54 @@ CHROMA_TELEMETRY_OFF: bool = not _as_bool(_env("CHROMA_ANONYMIZED_TELEMETRY", "F
 
 
 # =============================================================================
-# 3) 惰性导入 Chroma / Lazy-import Chroma
+# 3) 惰性导入 Chroma + 客户端/集合缓存 / Lazy import + cache
 # -----------------------------------------------------------------------------
+_CLIENT = None
+_COLLECTION = None
+
 def _chroma():
+    # 惰性导入，防止模块导入阶段崩溃
     from chromadb import PersistentClient, Settings  # type: ignore
     from chromadb.utils import embedding_functions   # type: ignore
     return PersistentClient, embedding_functions, Settings
 
+def clear_chroma_cache() -> None:
+    """用于调试：清除进程内客户端/集合缓存。"""
+    global _CLIENT, _COLLECTION
+    _CLIENT = None
+    _COLLECTION = None
 
-# =============================================================================
-# 4) 指南检索（Chroma）/ Guideline search (Chroma)
-# -----------------------------------------------------------------------------
-def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
-    if not query:
-        return []
-
-    PersistentClient, embedding_functions, Settings = _chroma()
-    client = PersistentClient(
-        path=CHROMA_PERSIST_DIR,
+def get_chroma_client(persist_dir: Optional[str] = None):
+    """获取（或创建并缓存）Chroma 客户端。"""
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+    PersistentClient, _, Settings = _chroma()
+    _CLIENT = PersistentClient(
+        path=(persist_dir or CHROMA_PERSIST_DIR),
         settings=Settings(
             anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
             allow_reset=True,
         ),
     )
+    return _CLIENT
+
+def get_chroma_collection(name: Optional[str] = None, embed_model: Optional[str] = None):
+    """获取（或创建并缓存）Chroma 集合；兼容指定 embedding 模型。"""
+    global _COLLECTION
+    if _COLLECTION is not None:
+        return _COLLECTION
+    _, embedding_functions, _ = _chroma()
+    client = get_chroma_client()
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBED_MODEL
+        model_name=(embed_model or EMBED_MODEL)
     )
     try:
-        collection = client.get_collection(
-            name=CHROMA_COLLECTION,
+        _COLLECTION = client.get_collection(
+            name=(name or CHROMA_COLLECTION),
             embedding_function=embed_fn,
         )
+        return _COLLECTION
     except Exception:
         # 自动探测集合名（优先包含 "guideline"）
         try:
@@ -121,11 +142,25 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
                 pick = cands[0]
             if not pick:
                 raise
-            collection = client.get_collection(name=pick, embedding_function=embed_fn)
-        except Exception as e:
-            raise e
+            _COLLECTION = client.get_collection(name=pick, embedding_function=embed_fn)
+            return _COLLECTION
+        except Exception:
+            # 继续抛出，由上层处理（UI 会给出友好提示）
+            raise
 
-    res = collection.query(
+
+# =============================================================================
+# 4) 指南检索（Chroma）/ Guideline search (Chroma)
+# -----------------------------------------------------------------------------
+def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
+    """
+    返回结构：[{ 'content': str, 'meta': {...}, 'score': float }, ...]
+    * 不改变既有签名；内部走缓存的 client/collection。
+    """
+    if not query:
+        return []
+    col = get_chroma_collection()
+    res = col.query(
         query_texts=[query],
         n_results=max(1, int(k)),
         include=["documents", "metadatas", "distances"],
@@ -161,7 +196,7 @@ def search_drug_structured(name_substr: str, limit: int = 10) -> List[Dict[str, 
     cur = con.cursor()
     try:
         cur.execute("SELECT * FROM drugs WHERE name LIKE ? LIMIT ?",
-                    (f"%{name_substr}%", int(limit)))
+                    (f\"%{name_substr}%\", int(limit)))
         rows = [dict(r) for r in cur.fetchall()]
     finally:
         try:
@@ -174,7 +209,6 @@ def search_drug_structured(name_substr: str, limit: int = 10) -> List[Dict[str, 
 # =============================================================================
 # 6) 列出集合（用于诊断面板）/ Safe collection listing for diagnostics
 # -----------------------------------------------------------------------------
-# --- 最小补丁（1）：SQLite 回退函数 ---
 def _fallback_collections_from_sqlite_dir(dir_path: str) -> List[str]:
     """
     当 API 枚举失败时，直接读取 {dir}/chroma.sqlite3 或 {dir}/*.sqlite* 的 collections 表拿集合名。
@@ -216,16 +250,9 @@ def list_collections_safe() -> List[Dict[str, Any]]:
     优先使用 Chroma API；失败则回退到 SQLite 扫描。
     返回 [{"name": 名称, "count": 计数或'?' } ...] 或 [{"error": "..."}]
     """
+    # 优先使用已缓存的 client（若尚未创建则创建）
     try:
-        PersistentClient, _, Settings = _chroma()
-        client = PersistentClient(
-            path=CHROMA_PERSIST_DIR,
-            settings=Settings(
-                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
-                allow_reset=True,
-            ),
-        )
-
+        client = get_chroma_client()
         out: List[Dict[str, Any]] = []
         for c in client.list_collections():
             name = getattr(c, "name", None) or "?"
@@ -239,7 +266,7 @@ def list_collections_safe() -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # --- 最小补丁（2）：SQLite 回退 ---
+    # 回退：直接扫 SQLite
     try:
         names = _fallback_collections_from_sqlite_dir(CHROMA_PERSIST_DIR)
         if names:
