@@ -7,5 +7,6 @@ torch
 pydantic>=2
 scikit-learn
 sqlite-utils
-pysqlite3-binary==0.5.3
+pysqlite3-binary==0.5.4 ; python_version >= "3.13"
+pysqlite3-binary==0.5.3 ; python_version < "3.13"
 chromadb==0.5.23
