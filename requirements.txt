@@ -1,13 +1,17 @@
-# 基础
-streamlit>=1.37
+# ---- Core ----
+streamlit==1.49.1
 pydantic<2.8
 numpy
 pandas
 
-# 检索与嵌入（按你的项目选择）
+# ---- RAG stack ----
 chromadb==0.5.5
-sentence-transformers>=2.6.1
-# 或者使用 BGE：FlagEmbedding>=1.2.10
+sentence-transformers>=2.7.0,<3.0
+# 如果你改用 BGE/FlagEmbedding，请移到这行并删掉上面的 sentence-transformers：
+# FlagEmbedding>=1.2.10
 
-# 关键：在 Streamlit Cloud 上提供 SQLite 动态库
-pysqlite3-binary==0.5.4
+# ---- SQLite shim for cloud ----
+pysqlite3-binary==0.5.2.post8
+
+# ---- Utils ----
+rich>=13.7,<15
