@@ -442,7 +442,7 @@ def render_diagnostics(lang: str = "zh") -> None:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
         # SQLite 存在性与表
-        db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
+        db_path = effective_cfg.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
         abs_db = os.path.abspath(db_path)
         st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
                  f"{abs_db} → {os.path.exists(abs_db)}")
