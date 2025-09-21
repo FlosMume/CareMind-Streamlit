@@ -8,16 +8,13 @@ retriever.py | CareMind
 2) 在 SQLite 中查询药品结构化信息
    Look up structured drug info in SQLite.
 
-# Module version marker for diagnostics
-VERSION = "retriever-2025-09-21a"
-
 关键设计 / Key design choices
 - ✅ Cloud 兼容：把 pysqlite3-binary 别名为 sqlite3，规避旧版 sqlite3 导致的 Chroma 报错。
   Cloud-compat: alias pysqlite3-binary → sqlite3 to satisfy Chroma's sqlite ≥3.35.
 - ✅ 惰性导入 Chroma：只在函数调用时导入，防止模块导入阶段崩溃。
   Lazy import chroma so the module never crashes during import.
 - ✅ 关闭 Chroma 遥测：通过 chromadb.config.Settings(anonymized_telemetry=False)。
-  Disable Chroma telemetry via Settings to silence ClientStartEvent noise.
+  Turn off anonymized telemetry by default.
 - ✅ Secrets 优先：通过 _env() 读取配置（先 Secrets，再环境变量，最后默认）。
   Secrets-first config via _env() (Secrets → env → default).
 - ✅ 安全的集合枚举：list_collections_safe() 仅返回 {name, count}，避免 _type 等序列化问题。
@@ -30,9 +27,12 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+# 模块版本号（用于诊断显示云端是否更新）
+VERSION = "retriever-2025-09-21a"
+
 # =============================================================================
 # 0) SQLite 兼容补丁（Cloud）/ SQLite compatibility shim (Cloud)
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------
 # 如果安装了 pysqlite3-binary，则将其别名为标准库 sqlite3，以获得 SQLite ≥ 3.35
 # If pysqlite3-binary is present, alias it to stdlib sqlite3 to get SQLite ≥ 3.35.
 try:
@@ -84,19 +84,10 @@ CHROMA_TELEMETRY_OFF: bool = not _as_bool(_env("CHROMA_ANONYMIZED_TELEMETRY", "F
 
 # =============================================================================
 # 3) 惰性导入 Chroma / Lazy-import Chroma
-# -----------------------------------------------------------------------------
+# ----------------------------------------
 def _chroma():
-    """
-    惰性导入 Chroma；返回 (PersistentClient, embedding_functions, Settings)
-    Lazy-import chroma; return (PersistentClient, embedding_functions, Settings).
-
-    说明 / Notes:
-    - 仅在需要访问向量库时才导入，避免模块导入期失败。
-      Importing only when needed avoids import-time crashes on Cloud.
-    """
-    from chromadb import PersistentClient
-    from chromadb.utils import embedding_functions
-    from chromadb.config import Settings  # 0.5.x: use Settings to configure the client
+    from chromadb import PersistentClient, Settings  # type: ignore
+    from chromadb.utils import embedding_functions   # type: ignore
     return PersistentClient, embedding_functions, Settings
 
 
@@ -111,60 +102,158 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
     Parameters
     ----------
     query : str
-        临床问题（中/英均可） / clinical question (cn/en ok)
+        临床问题（中/英均可） / clinical question (cn/en)
     k : int
-        返回的片段数量 / number of results to return
+        返回片段条数 / top-k snippets
     """
+    if not query:
+        return []
+
+    PersistentClient, embedding_functions, Settings = _chroma()
+    client = PersistentClient(
+        path=CHROMA_PERSIST_DIR,
+        settings=Settings(
+            anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
+            allow_reset=True,
+        ),
+    )
+    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=EMBED_MODEL
+    )
     try:
-        # 1) 获取客户端、嵌入函数与设置 / Client + embedding fn + settings
-        PersistentClient, embedding_functions, Settings = _chroma()
-
-        # 关闭匿名遥测并允许 reset（在临时/容器环境更安全）
-        # Disable anonymized telemetry & allow_reset for ephemeral environments
-        client = PersistentClient(
-            path=CHROMA_PERSIST_DIR,
-            settings=Settings(
-                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,  # False ⇒ disable telemetry
-                allow_reset=True,
-            ),
-        )
-
-        # 2) 绑定集合（若不存在则创建）/ Bind the collection (create if missing)
-        embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBED_MODEL
-        )
-        collection = client.get_or_create_collection(
+        collection = client.get_collection(
             name=CHROMA_COLLECTION,
             embedding_function=embed_fn,
         )
+    except Exception:
+        # 自动探测集合名（优先包含 "guideline" 的集合）
+        try:
+            cands = []
+            try:
+                for d in list_collections_safe():
+                    nm = d.get("name")
+                    if nm:
+                        cands.append(nm)
+            except Exception:
+                pass
+            pick = None
+            for nm in cands:
+                if "guideline" in nm.lower():
+                    pick = nm
+                    break
+            if not pick and cands:
+                pick = cands[0]
+            if not pick:
+                raise
+            collection = client.get_collection(name=pick, embedding_function=embed_fn)
+        except Exception as e:
+            # 直接抛出，交给上层处理
+            raise e
 
-        # 3) 查询 / Query
-        res = collection.query(
-            query_texts=[query],
-            n_results=int(k),
-            include=["documents", "metadatas"],
-        )
+    res = collection.query(
+        query_texts=[query],
+        n_results=max(1, int(k)),
+        include=["documents", "metadatas", "distances"],
+    )
+    docs = (res or {}).get("documents") or [[]]
+    metas = (res or {}).get("metadatas") or [[]]
+    dists = (res or {}).get("distances") or [[]]
 
-        # 4) 结果整形 / Shape results
-        docs  = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        return [{"content": d, "meta": m} for d, m in zip(docs, metas)]
-
-    except Exception as e:
-        # 失败时温和降级：打印日志并返回空列表（由上层决定如何回退）
-        # Soft-degrade: log & return [], letting pipeline decide a fallback/demo.
-        print("[retriever] search_guidelines error:", e)
-        return []
+    out: List[Dict[str, Any]] = []
+    for i, doc in enumerate(docs[0]):
+        meta = (metas[0][i] if i < len(metas[0]) else {}) or {}
+        score = (dists[0][i] if i < len(dists[0]) else None)
+        out.append({"content": doc, "meta": meta, "score": score})
+    return out
 
 
 # =============================================================================
-# 5) 列出集合（用于诊断面板）/ List collections for diagnostics
+# 5) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
 # -----------------------------------------------------------------------------
+def _connect_sqlite(path: str) -> sqlite3.Connection:
+    """
+    打开 SQLite 连接，Row 工厂方便以 dict-like 访问列。
+    Open SQLite connection with Row factory for dict-like column access.
+    """
+    if not os.path.exists(path):
+        if DEMO:
+            # 演示模式：使用内存库避免崩溃（无表即无结果）
+            # Demo mode: use in-memory db to avoid crash when missing file
+            return sqlite3.connect(":memory:")
+        raise FileNotFoundError(path)
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    return con
+
+def search_drug_structured(name_substr: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    模糊匹配药名（LIKE '%xxx%'），返回若干行（dict 列表）。
+    """
+    if not name_substr:
+        return []
+    con = _connect_sqlite(DRUG_DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM drugs WHERE name LIKE ? LIMIT ?",
+            (f"%{name_substr}%", int(limit)),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return rows
+
+
+# =============================================================================
+# 6) 列出集合（用于诊断面板）/ Safe collection listing for diagnostics
+# -----------------------------------------------------------------------------
+# --- 最小补丁（1）：SQLite 回退函数 ---
+# 当 client.list_collections() 遇到 `_type` 等序列化问题时，直接读 SQLite 获取集合名
+def _fallback_collections_from_sqlite_dir(dir_path: str) -> List[str]:
+    """
+    读取 {dir}/chroma.sqlite3 或 {dir}/*.sqlite* 的 collections 表以获取集合名。
+    仅用于诊断显示。
+    """
+    try:
+        import glob, sqlite3 as _sq
+        candidates: List[str] = []
+        p1 = os.path.join(dir_path, "chroma.sqlite3")
+        if os.path.exists(p1):
+            candidates.append(p1)
+        candidates.extend(glob.glob(os.path.join(dir_path, "*.sqlite*")))
+
+        names: List[str] = []
+        seen = set()
+        for fp in candidates:
+            con = None
+            try:
+                con = _sq.connect(fp)
+                cur = con.cursor()
+                cur.execute("SELECT name FROM collections")
+                for (nm,) in cur.fetchall():
+                    if nm and nm not in seen:
+                        seen.add(nm)
+                        names.append(nm)
+            except Exception:
+                pass
+            finally:
+                try:
+                    con and con.close()
+                except Exception:
+                    pass
+            if names:
+                break
+        return names
+    except Exception:
+        return []
+
 def list_collections_safe() -> List[Dict[str, Any]]:
     """
     安全地列出 Chroma 集合名称与条目数，避免把内部对象（含 `_type`）直接序列化。
-    Safely list Chroma collections with document counts, avoiding serialization of
-    internal objects (which may include `_type` and cause UI dump errors).
+    优先尝试 Chroma API；失败则回退到 SQLite 扫描。
     """
     try:
         PersistentClient, _, Settings = _chroma()
@@ -178,114 +267,20 @@ def list_collections_safe() -> List[Dict[str, Any]]:
 
         out: List[Dict[str, Any]] = []
         for c in client.list_collections():
-            # c 可能是一个带内部元数据的对象；只提取可序列化字段
-            # `c` may carry non-serializable fields; extract only safe fields.
             name = getattr(c, "name", None) or "?"
             try:
-                # 一些后端支持 c.count()；如不支持则以 1 条查询作为探针
-                # Some backends support c.count(); if not, probe with 1-result query
+                # 一些后端支持 c.count()；如不支持则宽容处理
                 count = int(c.count())
             except Exception:
-                try:
-                    col = client.get_collection(name=name)
-                    q = col.query(query_texts=["."], n_results=1)
-                    ids = q.get("ids", [[]])[0]
-                    count = len(ids)
-                except Exception as e:
-                    count = f"error: {e}"
+                count = "?"
             out.append({"name": name, "count": count})
-        return out
+        if out:
+            return out
 
-    except Exception as e:
-        return [{"error": str(e)}]
+    except Exception:
+        # 忽略异常，进入回退
+        pass
 
-
-# =============================================================================
-# 6) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
-# -----------------------------------------------------------------------------
-def _connect_sqlite(path: str) -> sqlite3.Connection:
-    """
-    打开 SQLite 连接，Row 工厂方便以 dict-like 访问列。
-    Open SQLite connection with Row factory for dict-like column access.
-    """
-    if not os.path.exists(path):
-        if DEMO:
-            # 演示模式：使用内存库避免崩溃（无表即无结果）
-            # Demo mode: in-memory DB to avoid crashes (no tables ⇒ no results).
-            con = sqlite3.connect(":memory:")
-            con.row_factory = sqlite3.Row
-            return con
-        raise FileNotFoundError(f"SQLite DB not found: {path}")
-
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
-    """
-    模糊检索药品信息（示例字段）；返回 dict 或 None。
-    Fuzzy lookup of a drug (example fields); returns dict or None.
-
-    假定表结构 / Assumed schema:
-      CREATE TABLE drugs (
-          id INTEGER PRIMARY KEY,
-          name TEXT, generic_name TEXT,
-          indications TEXT, contraindications TEXT,
-          interactions TEXT, pregnancy TEXT, source TEXT
-      )
-    """
-    name = (drug_name or "").strip()
-    if not name:
-        return None
-
-    con = _connect_sqlite(DRUG_DB_PATH)
-    try:
-        cur = con.cursor()
-
-        # 1) 近似精确匹配 / Near-exact match first
-        cur.execute(
-            """
-            SELECT name, generic_name, indications, contraindications,
-                   interactions, pregnancy, source
-            FROM drugs
-            WHERE name = ? OR generic_name = ?
-            LIMIT 1
-            """,
-            (name, name),
-        )
-        row = cur.fetchone()
-
-        # 2) LIKE 模糊匹配 / Fallback to LIKE fuzzy search
-        if not row:
-            kw = f"%{name}%"
-            cur.execute(
-                """
-                SELECT name, generic_name, indications, contraindications,
-                       interactions, pregnancy, source
-                FROM drugs
-                WHERE name LIKE ? OR generic_name LIKE ?
-                ORDER BY LENGTH(name) ASC
-                LIMIT 1
-                """,
-                (kw, kw),
-            )
-            row = cur.fetchone()
-
-        if not row:
-            return None
-
-        keys = ["name", "generic_name", "indications", "contraindications",
-                "interactions", "pregnancy", "source"]
-        return {k: row[idx] for idx, k in enumerate(keys)}
-
-    except Exception as e:
-        print("[retriever] search_drug_structured error:", e)
-        if DEMO:
-            return None
-        raise
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
+    # --- 最小补丁（2）：SQLite 回退 ---
+    names = _fallback_collections_from_sqlite_dir(CHROMA_PERSIST_DIR)
+    return [{"name": n, "count": "?"} for n in names] if names else [{"error": "no collections found"}]
