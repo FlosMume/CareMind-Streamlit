@@ -9,3 +9,4 @@ output/
 .streamlit/
 secrets.toml
 
+.streamlit/secrets.toml
