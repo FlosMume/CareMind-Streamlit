@@ -139,7 +139,7 @@ _chroma_client = None
 _collection = None
 
 def get_chroma_client():
-    """创建 Chroma Client（带全库预迁移 & 显式 Settings，一次且仅一次）。"""
+    """创建 Chroma PersistentClient（新API；清理旧配置键；仍保留全库预迁移）。"""
     global _chroma_client
     if _chroma_client is not None:
         return _chroma_client
@@ -148,30 +148,31 @@ def get_chroma_client():
     os.makedirs(PERSIST_DIR, exist_ok=True)
     _migrate_all_collections(PERSIST_DIR)
 
-    # 显式、稳定的 Settings —— 确保与进程内其他地方完全一致
+    # —— 关键：清理旧版配置相关的环境变量，避免触发 LEGACY 配置错误 ——
+    for k in [
+        "CHROMA_DB_IMPL",          # 旧：duckdb+parquet 等
+        "PERSIST_DIRECTORY",       # 旧：与 Settings.persist_directory 混用
+        "IS_PERSISTENT",           # 旧
+        "ALLOW_RESET",             # 旧
+        "TELEMETRY_IMPLEMENTATION" # 偶见
+    ]:
+        os.environ.pop(f"CHROMA_{k}", None)
+
+    # 新式用法：PersistentClient(path=...)
     import chromadb
+    from chromadb import PersistentClient
     from chromadb.config import Settings
 
-    settings = Settings(
-        chroma_db_impl="duckdb+parquet",   # 0.5.x 的持久化实现
-        is_persistent=True,
-        persist_directory=PERSIST_DIR,
-        anonymized_telemetry=False,
-        allow_reset=False,                 # 保守：不允许 reset（可按需改 True）
-    )
+    # 仅保留“可用且不属于旧键”的设置，例如关闭匿名遥测
+    settings = Settings(anonymized_telemetry=False)
 
-    # 统一用 Client(settings)（避免不同入口用 PersistentClient(path=...) 时引入隐式差异）
-    _chroma_client = chromadb.Client(settings)
+    _chroma_client = PersistentClient(path=PERSIST_DIR, settings=settings)
 
     _log("Chroma version:", getattr(chromadb, "__version__", "unknown"))
     _log("CHROMA_PERSIST_DIR:", PERSIST_DIR)
     _log("CHROMA_COLLECTION:", COLLECTION_NAME)
-    _log("Chroma settings:", {
-        "chroma_db_impl": "duckdb+parquet",
-        "is_persistent": True,
-        "anonymized_telemetry": False,
-    })
     return _chroma_client
+
 
 def get_chroma_collection():
     """
@@ -197,6 +198,8 @@ def get_chroma_collection():
         _collection = client.get_or_create_collection(name=target, embedding_function=embed_fn)
         _log("Collection opened after migrate+retry.")
         return _collection
+
+
 
 # ---------------------------
 # 指南向量检索
