@@ -10,4 +10,4 @@ sentence-transformers>=2.6.1
 # 或者使用 BGE：FlagEmbedding>=1.2.10
 
 # 关键：在 Streamlit Cloud 上提供 SQLite 动态库
-pysqlite3-binary==0.5.3.post3
+pysqlite3-binary==0.5.4
