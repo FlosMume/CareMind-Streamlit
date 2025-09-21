@@ -416,16 +416,16 @@ def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
     with st.expander(title, expanded=False):
         # 有效配置（Secrets>Env>默认）——以 retriever 中解析后的“最终值”为准
-st.write(t(lang, "diag_cfg"))
-effective_cfg = {
-    "CAREMIND_DEMO": R.DEMO,
-    "CHROMA_PERSIST_DIR": R.CHROMA_PERSIST_DIR,
-    "CHROMA_COLLECTION": R.CHROMA_COLLECTION,
-    "EMBEDDING_MODEL": R.EMBED_MODEL,
-    "DRUG_DB_PATH": R.DRUG_DB_PATH,
-    "CHROMA_TELEMETRY_OFF": R.CHROMA_TELEMETRY_OFF,
-}
-st.code(json.dumps(effective_cfg, ensure_ascii=False, indent=2))
+        st.write(t(lang, "diag_cfg"))
+        effective_cfg = {
+            "CAREMIND_DEMO": R.DEMO,
+            "CHROMA_PERSIST_DIR": R.CHROMA_PERSIST_DIR,
+            "CHROMA_COLLECTION": R.CHROMA_COLLECTION,
+            "EMBEDDING_MODEL": R.EMBED_MODEL,
+            "DRUG_DB_PATH": R.DRUG_DB_PATH,
+            "CHROMA_TELEMETRY_OFF": R.CHROMA_TELEMETRY_OFF,
+        }
+        st.code(json.dumps(effective_cfg, ensure_ascii=False, indent=2))
 
         # Chroma 目录存在性
         chroma_dir = effective_cfg.get("CHROMA_PERSIST_DIR") or "./chroma_store"
