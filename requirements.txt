@@ -11,7 +11,7 @@ sentence-transformers>=2.7.0,<3.0
 # FlagEmbedding>=1.2.10
 
 # ---- SQLite shim for cloud ----
-pysqlite3-binary==0.5.2.post8
+pysqlite3-binary==0.5.4
 
 # ---- Utils ----
 rich>=13.7,<15
