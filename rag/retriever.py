@@ -125,17 +125,20 @@ _collection = None
 def get_chroma_client():
     """
     新式客户端：PersistentClient(path=...)。
-    创建后立刻做一次“预检”：list_collections()
-    ——若此处就因旧配置报错（含 KeyError('_type')/deprecated/config 冲突），
-      立即隔离目录并重建客户端，确保后续安全。
+    三层兜底：
+      A. 创建失败（含 tenant 不存在） -> 隔离目录 -> 显式 tenant/database 再试
+      B. 创建成功但预检 list_collections() 失败 -> 隔离目录 -> 再试
+      C. 若仍异常 -> 再隔离一次 -> 最后重试
     """
     global _chroma_client
     if _chroma_client is not None:
         return _chroma_client
 
-    os.makedirs(PERSIST_DIR, exist_ok=True)
+    # 采用绝对路径，避免相对路径在不同 cwd 下造成多套实例
+    persist_path = os.path.abspath(PERSIST_DIR)
+    os.makedirs(persist_path, exist_ok=True)
 
-    # 清理遗留旧式环境键，避免被误判为 legacy 配置
+    # 清理可能引发“旧配置”判定的环境键
     for k in [
         "CHROMA_DB_IMPL",
         "CHROMA_PERSIST_DIRECTORY",
@@ -150,25 +153,50 @@ def get_chroma_client():
     from chromadb.config import Settings
 
     settings = Settings(anonymized_telemetry=False)
-    _chroma_client = PersistentClient(path=PERSIST_DIR, settings=settings)
 
-    # —— 关键预检：任何异常都视为“旧/损坏存储”，先隔离再重建 ——
+    def _make_client(explicit_td: bool = False):
+        if explicit_td:
+            # 显式 tenant/database，有些环境下能避免“tenant 不存在”的校验失败
+            return PersistentClient(
+                path=persist_path,
+                settings=settings,
+                tenant="default_tenant",
+                database="default_database",
+            )
+        else:
+            return PersistentClient(path=persist_path, settings=settings)
+
+    # ------- 第一枪：正常创建 -------
+    try:
+        _chroma_client = _make_client(explicit_td=False)
+    except Exception as e:
+        _log("PersistentClient init failed (first try):", repr(e))
+        _quarantine_persist_dir(persist_path)
+        try:
+            _chroma_client = _make_client(explicit_td=True)
+        except Exception as e2:
+            _log("PersistentClient init failed (second try, with tenant/database):", repr(e2))
+            # 最后再隔离一次后做最后重试
+            _quarantine_persist_dir(persist_path)
+            _chroma_client = _make_client(explicit_td=True)
+
+    # ------- 预检：列集合，若失败则隔离并重建 -------
     try:
         _ = _chroma_client.list_collections()
     except Exception as e:
-        msg = repr(e)
-        if ("'_type'" in msg) or ("deprecated configuration" in msg.lower()) or ("already exists for" in msg) or ("configuration" in msg.lower()):
-            _log("Preflight detected legacy/broken store; quarantining and rebuilding client...")
-            _quarantine_persist_dir(PERSIST_DIR)
-            _chroma_client = PersistentClient(path=PERSIST_DIR, settings=settings)
-        else:
-            # 不确定类型的异常，仍然隔离一次以最大化成功率
-            _log("Preflight error; quarantining as a safeguard...", msg)
-            _quarantine_persist_dir(PERSIST_DIR)
-            _chroma_client = PersistentClient(path=PERSIST_DIR, settings=settings)
+        _log("Preflight list_collections() failed:", repr(e))
+        _quarantine_persist_dir(persist_path)
+        try:
+            _chroma_client = _make_client(explicit_td=True)
+            _ = _chroma_client.list_collections()
+        except Exception as e2:
+            _log("Preflight failed again after quarantine:", repr(e2))
+            _quarantine_persist_dir(persist_path)
+            _chroma_client = _make_client(explicit_td=True)
+            _ = _chroma_client.list_collections()  # 若再失败让其冒泡
 
     _log("Chroma version:", getattr(chromadb, "__version__", "unknown"))
-    _log("CHROMA_PERSIST_DIR:", PERSIST_DIR)
+    _log("CHROMA_PERSIST_DIR:", persist_path)
     _log("CHROMA_COLLECTION:", COLLECTION_NAME)
     return _chroma_client
 
