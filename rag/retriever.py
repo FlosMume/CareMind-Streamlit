@@ -157,6 +157,42 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
 # =============================================================================
 # 5) 列出集合（用于诊断面板）/ List collections for diagnostics
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# SQLite-level fallback to discover collections (diagnostics only)
+def _fallback_collections_from_sqlite_dir(dir_path: str):
+    """Read {dir}/chroma.sqlite3 or *.sqlite* and fetch collection names.
+    This is ONLY used for diagnostics when client.list_collections() fails
+    (e.g., due to serialization of internal fields like `_type`)."""
+    try:
+        import glob, sqlite3 as _sq, os as _os
+        candidates = []
+        p1 = _os.path.join(dir_path, "chroma.sqlite3")
+        if _os.path.exists(p1):
+            candidates.append(p1)
+        candidates.extend(glob.glob(_os.path.join(dir_path, "*.sqlite*")))
+        names, seen = [], set()
+        for fp in candidates:
+            con = None
+            try:
+                con = _sq.connect(fp)
+                cur = con.cursor()
+                cur.execute("SELECT name FROM collections")
+                for (nm,) in cur.fetchall():
+                    if nm and nm not in seen:
+                        seen.add(nm); names.append(nm)
+            except Exception:
+                pass
+            finally:
+                try:
+                    con and con.close()
+                except Exception:
+                    pass
+            if names:
+                break
+        return names
+    except Exception:
+        return []
+
 def list_collections_safe() -> List[Dict[str, Any]]:
     """
     安全地列出 Chroma 集合名称与条目数，避免把内部对象（含 `_type`）直接序列化。
