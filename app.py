@@ -415,20 +415,15 @@ if res:
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
     with st.expander(title, expanded=False):
-        # 有效配置（Secrets>Env>默认）——以 retriever 中解析后的“最终值”为准
+        # 有效配置（Secrets 优先）
+        keys = ["CAREMIND_DEMO", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION",
+                "EMBEDDING_MODEL", "DRUG_DB_PATH"]
+        eff = {k: _env(k, None) for k in keys}
         st.write(t(lang, "diag_cfg"))
-        effective_cfg = {
-            "CAREMIND_DEMO": R.DEMO,
-            "CHROMA_PERSIST_DIR": R.CHROMA_PERSIST_DIR,
-            "CHROMA_COLLECTION": R.CHROMA_COLLECTION,
-            "EMBEDDING_MODEL": R.EMBED_MODEL,
-            "DRUG_DB_PATH": R.DRUG_DB_PATH,
-            "CHROMA_TELEMETRY_OFF": R.CHROMA_TELEMETRY_OFF,
-        }
-        st.code(json.dumps(effective_cfg, ensure_ascii=False, indent=2))
+        st.code(json.dumps(eff, ensure_ascii=False, indent=2))
 
         # Chroma 目录存在性
-        chroma_dir = effective_cfg.get("CHROMA_PERSIST_DIR") or "./chroma_store"
+        chroma_dir = eff.get("CHROMA_PERSIST_DIR") or "./chroma_store"
         abs_chroma = os.path.abspath(chroma_dir)
         st.write(f"{'Chroma 目录存在：' if lang=='zh' else 'Chroma dir exists:'} "
                  f"{abs_chroma} → {os.path.exists(abs_chroma)}")
@@ -442,7 +437,7 @@ def render_diagnostics(lang: str = "zh") -> None:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
         # SQLite 存在性与表
-        db_path = effective_cfg.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
+        db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
         abs_db = os.path.abspath(db_path)
         st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
                  f"{abs_db} → {os.path.exists(abs_db)}")

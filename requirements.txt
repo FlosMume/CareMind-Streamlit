@@ -1,12 +1,15 @@
-streamlit>=1.37
-pandas
-numpy
-chromadb==0.5.*
-sentence-transformers
-torch
-pydantic>=2
-scikit-learn
-sqlite-utils
-pysqlite3-binary==0.5.4 ; python_version >= "3.13"
-pysqlite3-binary==0.5.3 ; python_version < "3.13"
+# CareMind - requirements for Python 3.10.18 (local & Streamlit Cloud with runtime.txt)
+# Pin torch CPU by version range; GPU builds are not required on Cloud.
+streamlit>=1.33,<2
+pandas>=2.1,<2.4
+numpy>=1.24,<2.0
+
 chromadb==0.5.23
+sentence-transformers>=2.6,<3
+torch>=2.2,<2.9
+
+# SQLite shim so retriever.py can map pysqlite3 -> sqlite3 for Chroma
+pysqlite3-binary==0.5.3
+
+sqlite-utils>=3.35,<4
+pydantic>=2.5,<3
