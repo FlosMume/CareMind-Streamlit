@@ -18,9 +18,9 @@ SYSTEM = """你是一名临床药师/循证护理专家。请仅依据“检索�
 USER_TEMPLATE = """【临床问题】
 {question}
 
-【检索到的指南/共识片段（Top-{k}）】
-{guideline_snippets}
+【检索到的指南/共识片段】
+{evidence_md}
 
 【药品结构化信息】
-{drug_info}
+{drug}
 """

@@ -1,291 +1,387 @@
 # -*- coding: utf-8 -*-
 """
-retriever.py | CareMind
------------------------
-职责 / Responsibilities
-1) 在 Chroma 向量库中检索指南片段
-   Retrieve guideline text chunks from a Chroma vector DB.
-2) 在 SQLite 中查询药品结构化信息
-   Look up structured drug info in SQLite.
+retriever.py  — CareMind RAG 检索层（Chroma 0.5.x 版）
 
-# Module version marker for diagnostics
-VERSION = "retriever-2025-09-21a"
-
-关键设计 / Key design choices
-- ✅ Cloud 兼容：把 pysqlite3-binary 别名为 sqlite3，规避旧版 sqlite3 导致的 Chroma 报错。
-  Cloud-compat: alias pysqlite3-binary → sqlite3 to satisfy Chroma's sqlite ≥3.35.
-- ✅ 惰性导入 Chroma：只在函数调用时导入，防止模块导入阶段崩溃。
-  Lazy import chroma so the module never crashes during import.
-- ✅ 关闭 Chroma 遥测：通过 chromadb.config.Settings(anonymized_telemetry=False)。
-  Disable Chroma telemetry via Settings to silence ClientStartEvent noise.
-- ✅ Secrets 优先：通过 _env() 读取配置（先 Secrets，再环境变量，最后默认）。
-  Secrets-first config via _env() (Secrets → env → default).
-- ✅ 安全的集合枚举：list_collections_safe() 仅返回 {name, count}，避免 _type 等序列化问题。
-  Safe collection listing that avoids serializing Chroma internals like `_type`.
+功能要点：
+1) 显式与集合绑定相同的 SentenceTransformer 嵌入函数，避免 “384 vs 1024 维度不匹配”。
+2) 仅 get_collection，不 create，防止误建空集合导致“无命中假象”。
+3) 健壮日志：集合缺失、集合为空、维度不匹配时直观报错并给修复建议。
+4) 可选：SQLite FTS5 药品库检索，与向量检索做 RRF 融合（--method rrf）。
+5) 兼容脚本运行：python rag/retriever.py --q "..." --method rrf --topn 10
 """
 
 from __future__ import annotations
-
 import os
 import sys
-from typing import Any, Dict, List, Optional
+import argparse
+import importlib
+from typing import List, Dict, Any, Optional
 
-# =============================================================================
-# 0) SQLite 兼容补丁（Cloud）/ SQLite compatibility shim (Cloud)
-# -----------------------------------------------------------------------------
-# 如果安装了 pysqlite3-binary，则将其别名为标准库 sqlite3，以获得 SQLite ≥ 3.35
-# If pysqlite3-binary is present, alias it to stdlib sqlite3 to get SQLite ≥ 3.35.
+# ---------------------------
+# sqlite3 兜底别名（云环境常用）
+# ---------------------------
 try:
-    import pysqlite3  # type: ignore
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+    import sqlite3  # type: ignore
 except Exception:
-    # 如果不可用，则继续使用系统自带 sqlite3；若版本过低，Chroma 端可能在运行时报错
-    # If unavailable, we keep system sqlite3; Chroma may later complain if too old.
-    pass
-
-import sqlite3  # after aliasing
-
-
-# =============================================================================
-# 1) Secrets-aware env helpers / 读取配置优先 Secrets
-# -----------------------------------------------------------------------------
-def _env(key: str, default: str | None = None) -> str | None:
-    """
-    优先从 st.secrets 读取（Cloud 上 App settings → Secrets），否则读取环境变量，最后默认值。
-    Prefer st.secrets on Cloud, then os.environ, otherwise default.
-    """
     try:
-        import streamlit as st  # imported lazily; safe when Streamlit is absent
-        return os.getenv(key, st.secrets.get(key, default))
-    except Exception:
-        return os.getenv(key, default)
+        import pysqlite3 as sqlite3  # type: ignore
+        sys.modules["sqlite3"] = sqlite3
+        print("ℹ️ retriever: sqlite3 → pysqlite3 别名启用")
+    except Exception as e:
+        print(f"⚠️ retriever: 无法提供 sqlite3: {e}")
 
-def _as_bool(val: str | None, default: bool = False) -> bool:
-    """将 '1'/'true'/'yes' 等解析为布尔值 / Parse common truthy strings to bool."""
-    if val is None:
-        return default
-    return str(val).strip().lower() in {"1", "true", "yes", "on"}
-
-
-# =============================================================================
-# 2) 环境变量与默认配置 / Env vars & defaults
-# -----------------------------------------------------------------------------
-CHROMA_PERSIST_DIR: str = _env("CHROMA_PERSIST_DIR", "./chroma_store") or "./chroma_store"
-CHROMA_COLLECTION: str  = _env("CHROMA_COLLECTION",  "guideline_chunks") or "guideline_chunks"
-EMBED_MODEL: str        = _env("EMBEDDING_MODEL",    "sentence-transformers/all-MiniLM-L6-v2") \
-                          or "sentence-transformers/all-MiniLM-L6-v2"
-DRUG_DB_PATH: str       = _env("DRUG_DB_PATH",       "./db/drugs.sqlite") or "./db/drugs.sqlite"
-DEMO: bool              = _as_bool(_env("CAREMIND_DEMO", "1"), default=True)
-
-# 允许通过 Secrets/env 覆盖是否关闭 Chroma 遥测（默认关闭）
-# Allow overriding anonymized telemetry via Secrets/env (default: OFF)
-CHROMA_TELEMETRY_OFF: bool = not _as_bool(_env("CHROMA_ANONYMIZED_TELEMETRY", "False"), default=False)
+# ---------------------------
+# 环境变量与默认值
+# ---------------------------
+PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "guideline_chunks_1024_v2")
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")  # 1024维
+DRUG_DB_PATH = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")  # 可选
 
 
-# =============================================================================
-# 3) 惰性导入 Chroma / Lazy-import Chroma
-# -----------------------------------------------------------------------------
-def _chroma():
+
+# Add a version string for easier debugging
+VERSION = "2025-09-21"
+
+# ---------------------------
+# A safe collections lister
+# ---------------------------
+
+def list_collections_safe():
     """
-    惰性导入 Chroma；返回 (PersistentClient, embedding_functions, Settings)
-    Lazy-import chroma; return (PersistentClient, embedding_functions, Settings).
-
-    说明 / Notes:
-    - 仅在需要访问向量库时才导入，避免模块导入期失败。
-      Importing only when needed avoids import-time crashes on Cloud.
+    Return [{'name': ..., 'count': int}] without touching private attrs,
+    so it won't break on Chroma 0.5.x internals.
     """
+    client = _lazy_chroma_client()
+    out = []
+    try:
+        for c in client.list_collections():
+            try:
+                # Avoid accessing c._collection/_type; just open and count.
+                col = client.get_collection(name=c.name, embedding_function=_embedding_fn())
+                out.append({"name": c.name, "count": col.count()})
+            except Exception:
+                out.append({"name": c.name, "count": None})
+    except Exception as e:
+        raise RuntimeError(f"list_collections failed: {e}")
+    return out
+
+
+# ---------------------------
+# Chroma 客户端 & 嵌入函数
+# ---------------------------
+def _lazy_chroma_client():
+    chroma = importlib.import_module("chromadb")
     from chromadb import PersistentClient
+    ver = getattr(chroma, "__version__", "unknown")
+    print(f"[Retriever] Chroma v{ver} | dir={PERSIST_DIR}")
+    return PersistentClient(path=PERSIST_DIR)
+
+def _embedding_fn():
     from chromadb.utils import embedding_functions
-    from chromadb.config import Settings  # 0.5.x: use Settings to configure the client
-    return PersistentClient, embedding_functions, Settings
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=EMBED_MODEL
+    )
 
-
-# =============================================================================
-# 4) 指南检索（Chroma）/ Guideline search (Chroma)
-# -----------------------------------------------------------------------------
-def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
-    """
-    使用 Chroma 进行语义检索；返回 [{"content": 文本, "meta": 元数据}, ...]
-    Semantic search via Chroma; returns [{"content": str, "meta": dict}, ...].
-
-    Parameters
-    ----------
-    query : str
-        临床问题（中/英均可） / clinical question (cn/en ok)
-    k : int
-        返回的片段数量 / number of results to return
-    """
+def get_chroma_collection():
+    client = _lazy_chroma_client()
     try:
-        # 1) 获取客户端、嵌入函数与设置 / Client + embedding fn + settings
-        PersistentClient, embedding_functions, Settings = _chroma()
+        names = [c.name for c in client.list_collections()]
+    except Exception as e:
+        raise RuntimeError(f"❌ list_collections 失败：{e}")
+    if COLLECTION_NAME not in names:
+        raise RuntimeError(f"❌ 找不到集合《{COLLECTION_NAME}》。可用集合：{names}")
 
-        # 关闭匿名遥测并允许 reset（在临时/容器环境更安全）
-        # Disable anonymized telemetry & allow_reset for ephemeral environments
-        client = PersistentClient(
-            path=CHROMA_PERSIST_DIR,
-            settings=Settings(
-                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,  # False ⇒ disable telemetry
-                allow_reset=True,
-            ),
-        )
+    try:
+        col = client.get_collection(name=COLLECTION_NAME, embedding_function=_embedding_fn())
+    except Exception as e:
+        raise RuntimeError(f"❌ 打开集合失败：{e}")
 
-        # 2) 绑定集合（若不存在则创建）/ Bind the collection (create if missing)
-        embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBED_MODEL
-        )
-        collection = client.get_or_create_collection(
-            name=CHROMA_COLLECTION,
-            embedding_function=embed_fn,
-        )
+    n = col.count()
+    if n == 0:
+        raise RuntimeError(f"❌ 集合《{COLLECTION_NAME}》为空。请检查 ingest 是否写入成功。")
+    print(f"[Retriever] 打开集合《{COLLECTION_NAME}》 | docs={n} | embed={EMBED_MODEL}")
+    return col
 
-        # 3) 查询 / Query
-        res = collection.query(
+# ---------------------------
+# 元数据归一化
+# ---------------------------
+def _normalize_meta(m: dict) -> dict:
+    """把常见别名归一化到 UI 需要的字段：source/title/year/page/chunk_id。"""
+    if not isinstance(m, dict):
+        return {}
+    n = dict(m)  # shallow copy
+
+    aliases = {
+        # source
+        "src": "source",
+        "file": "source",
+        "filename": "source",
+        "filepath": "source",
+        "source_filename": "source",
+        # title
+        "name": "title",
+        "doc_title": "title",
+        # year / page
+        "pub_year": "year",
+        "year_": "year",
+        "pages": "page",
+        "pg": "page",
+        "page_no": "page",
+        # chunk id
+        "chunk": "chunk_id",
+        "chunkId": "chunk_id",
+        "id": "chunk_id",
+    }
+    for k, v in list(n.items()):
+        if k in aliases and aliases[k] not in n:
+            n[aliases[k]] = v
+
+    # 页码清洗
+    try:
+        if isinstance(n.get("page"), str):
+            import re
+            m0 = re.search(r"\d+", n["page"])
+            if m0:
+                n["page"] = int(m0.group(0))
+    except Exception:
+        pass
+
+    # 保证这些键存在
+    for k in ("source", "title", "year", "page", "chunk_id"):
+        n.setdefault(k, None)
+
+    # 保留常见科研字段
+    for k in ("doi", "journal_name", "issue", "volume", "authors", "section_title"):
+        if k not in n and k in m:
+            n[k] = m[k]
+
+    return n
+
+# ---------------------------
+# 指南向量检索
+# ---------------------------
+def search_guidelines(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    col = get_chroma_collection()
+    try:
+        res = col.query(
             query_texts=[query],
-            n_results=int(k),
+            n_results=max(1, k),
             include=["documents", "metadatas"],
         )
-
-        # 4) 结果整形 / Shape results
-        docs  = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        return [{"content": d, "meta": m} for d, m in zip(docs, metas)]
-
     except Exception as e:
-        # 失败时温和降级：打印日志并返回空列表（由上层决定如何回退）
-        # Soft-degrade: log & return [], letting pipeline decide a fallback/demo.
-        print("[retriever] search_guidelines error:", e)
+        raise RuntimeError(
+            f"❌ 向量检索异常：{e}\n"
+            f"→ 高概率为嵌入维度/模型不一致，请确保 EMBEDDING_MODEL 与 ingest 一致（当前：{EMBED_MODEL}）。"
+        )
+
+    ids = (res or {}).get("ids") or [[]]
+    docs = (res or {}).get("documents") or [[]]
+    metas = (res or {}).get("metadatas") or [[]]
+
+    hits: List[Dict[str, Any]] = []
+    n = len(ids[0]) if ids else 0
+    for i in range(n):
+        txt = docs[0][i] if i < len(docs[0]) else ""
+        meta_raw = metas[0][i] if i < len(metas[0]) else {}
+        title = str(meta_raw.get("title") or "")
+        # 关键词简单打分：标题*2 + 正文*1
+        kw = ["老年","糖尿病","冠心病","β受体阻滞剂","目标","首选","禁忌","监测","ACEI","ARB","钙拮抗剂","利尿剂"]
+        s = 0
+        tl = title.lower(); xl = txt.lower()
+        for k in kw:
+            k2 = k.lower()
+            if k2 in tl: s += 2
+            if k2 in xl: s += 1
+        hits.append({
+            "id": ids[0][i] if i < len(ids[0]) else None,
+            "doc": txt,
+            "content": txt,
+            "meta": _normalize_meta(meta_raw),
+            "_kwscore": s,  # 仅用于本地重排
+        })
+    # 用关键词分数做一次稳定重排：先按 _kwscore，再按原顺序
+    hits = sorted(enumerate(hits), key=lambda p: (p[1]["_kwscore"], -p[0]), reverse=True)
+    hits = [{k:v for k,v in h.items() if k != "_kwscore"} for _, h in hits]
+    return hits
+
+# ---------------------------
+# 药品库 SQLite FTS 检索（可选）
+# ---------------------------
+def _has_drug_db(path: str) -> bool:
+    return os.path.exists(path) and os.path.isfile(path)
+
+def search_drug_fts(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    if not _has_drug_db(DRUG_DB_PATH):
+        return []
+    try:
+        conn = sqlite3.connect(DRUG_DB_PATH)
+        conn.row_factory = sqlite3.Row
+    except Exception as e:
+        print(f"⚠️ 无法打开药品数据库：{e}")
         return []
 
-
-# =============================================================================
-# 5) 列出集合（用于诊断面板）/ List collections for diagnostics
-# -----------------------------------------------------------------------------
-def list_collections_safe() -> List[Dict[str, Any]]:
+    sql = """
+    SELECT
+        name,
+        COALESCE(indication,'') AS indication,
+        COALESCE(contraindication,'') AS contraindication,
+        COALESCE(interaction,'') AS interaction,
+        COALESCE(pregnancy,'') AS pregnancy,
+        COALESCE(source,'') AS source,
+        bm25(drugs_fts) AS rank
+    FROM drugs_fts
+    WHERE drugs_fts MATCH ?
+    ORDER BY rank LIMIT ?;
     """
-    安全地列出 Chroma 集合名称与条目数，避免把内部对象（含 `_type`）直接序列化。
-    Safely list Chroma collections with document counts, avoiding serialization of
-    internal objects (which may include `_type` and cause UI dump errors).
-    """
+    q = query.replace(" ", " OR ")
     try:
-        PersistentClient, _, Settings = _chroma()
-        client = PersistentClient(
-            path=CHROMA_PERSIST_DIR,
-            settings=Settings(
-                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
-                allow_reset=True,
-            ),
-        )
-
-        out: List[Dict[str, Any]] = []
-        for c in client.list_collections():
-            # c 可能是一个带内部元数据的对象；只提取可序列化字段
-            # `c` may carry non-serializable fields; extract only safe fields.
-            name = getattr(c, "name", None) or "?"
-            try:
-                # 一些后端支持 c.count()；如不支持则以 1 条查询作为探针
-                # Some backends support c.count(); if not, probe with 1-result query
-                count = int(c.count())
-            except Exception:
-                try:
-                    col = client.get_collection(name=name)
-                    q = col.query(query_texts=["."], n_results=1)
-                    ids = q.get("ids", [[]])[0]
-                    count = len(ids)
-                except Exception as e:
-                    count = f"error: {e}"
-            out.append({"name": name, "count": count})
-        return out
-
+        cur = conn.execute(sql, (q, int(max(1, k))))
+        rows = cur.fetchall()
     except Exception as e:
-        return [{"error": str(e)}]
-
-
-# =============================================================================
-# 6) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
-# -----------------------------------------------------------------------------
-def _connect_sqlite(path: str) -> sqlite3.Connection:
-    """
-    打开 SQLite 连接，Row 工厂方便以 dict-like 访问列。
-    Open SQLite connection with Row factory for dict-like column access.
-    """
-    if not os.path.exists(path):
-        if DEMO:
-            # 演示模式：使用内存库避免崩溃（无表即无结果）
-            # Demo mode: in-memory DB to avoid crashes (no tables ⇒ no results).
-            con = sqlite3.connect(":memory:")
-            con.row_factory = sqlite3.Row
-            return con
-        raise FileNotFoundError(f"SQLite DB not found: {path}")
-
-    con = sqlite3.connect(path)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
-    """
-    模糊检索药品信息（示例字段）；返回 dict 或 None。
-    Fuzzy lookup of a drug (example fields); returns dict or None.
-
-    假定表结构 / Assumed schema:
-      CREATE TABLE drugs (
-          id INTEGER PRIMARY KEY,
-          name TEXT, generic_name TEXT,
-          indications TEXT, contraindications TEXT,
-          interactions TEXT, pregnancy TEXT, source TEXT
-      )
-    """
-    name = (drug_name or "").strip()
-    if not name:
-        return None
-
-    con = _connect_sqlite(DRUG_DB_PATH)
-    try:
-        cur = con.cursor()
-
-        # 1) 近似精确匹配 / Near-exact match first
-        cur.execute(
-            """
-            SELECT name, generic_name, indications, contraindications,
-                   interactions, pregnancy, source
-            FROM drugs
-            WHERE name = ? OR generic_name = ?
-            LIMIT 1
-            """,
-            (name, name),
-        )
-        row = cur.fetchone()
-
-        # 2) LIKE 模糊匹配 / Fallback to LIKE fuzzy search
-        if not row:
-            kw = f"%{name}%"
-            cur.execute(
-                """
-                SELECT name, generic_name, indications, contraindications,
-                       interactions, pregnancy, source
-                FROM drugs
-                WHERE name LIKE ? OR generic_name LIKE ?
-                ORDER BY LENGTH(name) ASC
-                LIMIT 1
-                """,
-                (kw, kw),
-            )
-            row = cur.fetchone()
-
-        if not row:
-            return None
-
-        keys = ["name", "generic_name", "indications", "contraindications",
-                "interactions", "pregnancy", "source"]
-        return {k: row[idx] for idx, k in enumerate(keys)}
-
-    except Exception as e:
-        print("[retriever] search_drug_structured error:", e)
-        if DEMO:
-            return None
-        raise
+        print(f"⚠️ 药品FTS检索失败：{e}")
+        rows = []
     finally:
         try:
-            con.close()
+            conn.close()
         except Exception:
             pass
+
+    hits: List[Dict[str, Any]] = []
+    for r in rows:
+        hits.append({
+            "name": r["name"],
+            "rank": r["rank"],
+            "indication": r["indication"],
+            "contraindication": r["contraindication"],
+            "interaction": r["interaction"],
+            "pregnancy": r["pregnancy"],
+            "source": r["source"],
+        })
+    return hits
+
+# ---------------------------
+# RRF 融合
+# ---------------------------
+def _rrf_merge(
+    vec_hits: List[Dict[str, Any]],
+    drug_hits: List[Dict[str, Any]],
+    topn: int = 10,
+    k_rrf: float = 60.0,
+) -> List[Dict[str, Any]]:
+    scores: Dict[str, float] = {}
+    payload: Dict[str, Dict[str, Any]] = {}
+
+    def add_score(key: str, add: float, obj: Dict[str, Any]):
+        scores[key] = scores.get(key, 0.0) + add
+        if key not in payload:
+            payload[key] = obj
+
+    for i, h in enumerate(vec_hits):
+        key = h.get("id") or f"vec_{i}"
+        add_score(key, 1.0 / (k_rrf + i + 1), {"type": "guideline", **h})
+
+    for j, h in enumerate(drug_hits):
+        key = f"drug_{h.get('name','?')}_{j}"
+        add_score(key, 1.0 / (k_rrf + j + 1), {"type": "drug", **h})
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:topn]
+    return [payload[k] for k, _ in ranked]
+
+# ---------------------------
+# 混合检索入口
+# ---------------------------
+def hybrid_search(
+    query: str,
+    method: str = "rrf",
+    topn: int = 10,
+    k_guideline: Optional[int] = None,
+    k_drug: Optional[int] = None,
+) -> Dict[str, Any]:
+    k_guideline = k_guideline or max(3, min(20, topn))
+    k_drug = k_drug or max(3, min(20, topn))
+
+    out: Dict[str, Any] = {"query": query}
+    vec_hits: List[Dict[str, Any]] = []
+    drug_hits: List[Dict[str, Any]] = []
+
+    if method in ("vec", "rrf"):
+        try:
+            vec_hits = search_guidelines(query, k=k_guideline)
+        except Exception as e:
+            print(str(e))
+            vec_hits = []
+    if method in ("sql", "rrf"):
+        drug_hits = search_drug_fts(query, k=k_drug)
+
+    out["guideline_hits"] = vec_hits
+    out["drug_hits"] = drug_hits
+
+    if method == "rrf":
+        out["fused"] = _rrf_merge(vec_hits, drug_hits, topn=topn)
+    elif method == "vec":
+        out["fused"] = vec_hits[:topn]
+    elif method == "sql":
+        out["fused"] = drug_hits[:topn]
+    else:
+        out["fused"] = []
+    return out
+
+# ---------------------------
+# CLI
+# ---------------------------
+def _preview_doc(text: Optional[str], limit: int = 160) -> str:
+    if not text:
+        return ""
+    return (text[:limit] + ("…" if len(text) > limit else "")).replace("\n", " ")
+
+def main():
+    parser = argparse.ArgumentParser(description="CareMind Retriever (Chroma 0.5.x)")
+    parser.add_argument("--q", "--query", dest="query", required=True, help="查询语句")
+    parser.add_argument("--method", choices=["vec", "sql", "rrf"], default="rrf", help="检索方式")
+    parser.add_argument("--topn", type=int, default=10, help="返回条数")
+    args = parser.parse_args()
+
+    print(f"Embedding model: {EMBED_MODEL}")
+    print(f"Chroma dir:     {PERSIST_DIR} | collection={COLLECTION_NAME}")
+    if os.path.exists(DRUG_DB_PATH):
+        print(f"SQLite path:    {DRUG_DB_PATH}")
+    else:
+        print("SQLite path:    (未配置或文件不存在，跳过药品 FTS)")
+
+    if args.method == "vec":
+        vec = search_guidelines(args.query, k=args.topn)
+        print(f"\n[Guideline(Vector)] Hits={len(vec)}")
+        for i, h in enumerate(vec, 1):
+            m = h.get("meta") or {}
+            print(f"{i:02d}. {_preview_doc(h.get('doc'))}")
+            print(f"    来源: {m.get('source')} | 标题: {m.get('title')} | 年份: {m.get('year')}")
+    elif args.method == "sql":
+        drug = search_drug_fts(args.query, k=args.topn)
+        print(f"\n[Drug(FTS)] Hits={len(drug)}")
+        for i, h in enumerate(drug, 1):
+            print(f"{i:02d}. {h.get('name')}  (rank={h.get('rank'):.4f})")
+            print(f"    适应症: {_preview_doc(h.get('indication'))}")
+            print(f"    禁忌症: {_preview_doc(h.get('contraindication'))}")
+            print(f"    交互:   {_preview_doc(h.get('interaction'))}")
+            print(f"    妊娠:   {_preview_doc(h.get('pregnancy'))}")
+            print(f"    来源:   {_preview_doc(h.get('source'))}")
+    else:
+        res = hybrid_search(args.query, method="rrf", topn=args.topn)
+        fused = res.get("fused") or []
+        print(f"\n[RRF Fused] TopN={len(fused)}")
+        for i, h in enumerate(fused, 1):
+            if h.get("type") == "guideline":
+                m = h.get("meta") or {}
+                print(f"{i:02d}. [指南] {_preview_doc(h.get('doc'))}")
+                print(f"    来源: {m.get('source')} | 标题: {m.get('title')} | 年份: {m.get('year')}")
+            else:
+                print(f"{i:02d}. [药品] {h.get('name')} (rank≈{h.get('rank'):.4f})")
+                print(f"    适应症: {_preview_doc(h.get('indication'))}")
+                print(f"    禁忌症: {_preview_doc(h.get('contraindication'))}")
+                print(f"    交互:   {_preview_doc(h.get('interaction'))}")
+                print(f"    妊娠:   {_preview_doc(h.get('pregnancy'))}")
+                print(f"    来源:   {_preview_doc(h.get('source'))}")
+
+if __name__ == "__main__":
+    main()
