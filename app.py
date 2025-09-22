@@ -17,6 +17,13 @@ import streamlit as st
 import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载遮蔽
 from rag import retriever as R              # 供诊断面板使用（读取版本 + 安全列集合）
 
+try:
+    import pysqlite3  # noqa: F401
+    import sys
+    sys.modules["sqlite3"] = __import__("pysqlite3")
+except Exception:
+    pass
+
 # ---------------------------
 # 小工具
 # ---------------------------
