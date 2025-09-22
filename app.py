@@ -451,6 +451,29 @@ def render_diagnostics(lang: str = "zh") -> None:
         except Exception as e:
             st.warning(("SQLite 错误：" if lang=='zh' else "SQLite error: ") + str(e))
 
+        with st.expander("Chroma 快速抽样（peek）", expanded=False):
+            try:
+                from chromadb import PersistentClient
+                client = PersistentClient(path=os.getenv("CHROMA_PERSIST_DIR", "./chroma_store"))
+                col = client.get_collection(os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2"))
+                sample = col.peek(3)
+                st.json(sample)
+            except Exception as e:
+                st.error(f"peek 失败: {e}")
+
+        with st.expander("where_document 直搜（不走向量）", expanded=False):
+            try:
+                kw = "β受体阻滞剂"
+                res = col.query(
+                    where_document={"$contains": kw},
+                    n_results=3,
+                    include=["documents", "metadatas"]
+                )
+                st.write(f"where_document contains '{kw}' 命中数: {len(res.get('documents',[[]])[0])}")
+                st.json(res)
+            except Exception as e:
+                st.error(f"where_document 查询失败: {e}")
+
 # 页面底部渲染诊断与页脚
 render_diagnostics(lang)
 st.caption("© CareMind · MVP CDSS | 本工具仅供临床决策参考，不替代医师诊断与处方。" if lang=="zh"
