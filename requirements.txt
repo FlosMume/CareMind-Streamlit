@@ -9,4 +9,5 @@ pysqlite3-binary==0.5.2.post3
 
 # ---- (可选) 查询向量编码：如果你的检索在运行时需要编码查询文本，保留下面两行 ----
 sentence-transformers==3.0.1
-torch==2.3.1
+torch==2.6.0
+--extra-index-url https://download.pytorch.org/whl/cpu
