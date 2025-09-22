@@ -1,15 +1,12 @@
-# CareMind - requirements for Python 3.10.18 (local & Streamlit Cloud with runtime.txt)
-# Pin torch CPU by version range; GPU builds are not required on Cloud.
-streamlit>=1.33,<2
-pandas>=2.1,<2.4
-numpy>=1.24,<2.0
+# ---- Web UI ----
+streamlit==1.49.1
 
-chromadb==0.5.23
-sentence-transformers>=2.6,<3
-torch>=2.2,<2.9
+# ---- Vector DB ----
+chromadb==0.5.5
+pydantic<3
+numpy<2.0
+pysqlite3-binary==0.5.2.post3
 
-# SQLite shim so retriever.py can map pysqlite3 -> sqlite3 for Chroma
-pysqlite3-binary==0.5.3
-
-sqlite-utils>=3.35,<4
-pydantic>=2.5,<3
+# ---- (可选) 查询向量编码：如果你的检索在运行时需要编码查询文本，保留下面两行 ----
+sentence-transformers==3.0.1
+torch==2.3.1
