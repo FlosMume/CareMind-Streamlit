@@ -21,7 +21,7 @@ import json
 import time
 import inspect
 from typing import Any, Dict, List, Optional
-
+import importlib
 import streamlit as st
 import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
 from rag import retriever as R              # 供诊断面板使用（读取常量 + 安全列集合）
@@ -37,6 +37,37 @@ try:
     sys.modules["sqlite3"] = __import__("pysqlite3")
 except Exception:
     pass
+
+
+with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
+    st.write("**Python version**:", sys.version)
+    st.write("**sqlite3 module version**:", sqlite3.version)
+    st.write("**sqlite3 library version**:", sqlite3.sqlite_version)
+
+    try:
+        import torch
+        st.write("**Torch version**:", torch.__version__)
+    except Exception as e:
+        st.error(f"Torch not available: {e}")
+
+    try:
+        chromadb = importlib.import_module("chromadb")
+        st.write("**Chroma version**:", chromadb.__version__)
+    except Exception as e:
+        st.error(f"Chroma import failed: {e}")
+
+    persist = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+    coll = os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2")
+    st.write("**CHROMA_PERSIST_DIR**:", persist)
+    st.write("**CHROMA_COLLECTION (from env)**:", coll)
+
+    try:
+        client = chromadb.PersistentClient(path=persist)
+        col = client.get_collection(coll)
+        st.write("**Collection count**:", col.count())
+    except Exception as e:
+        st.error(f"❌ Failed to open collection: {e}")
+
 
 # ---------------------------
 # 小工具

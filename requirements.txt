@@ -1,17 +1,13 @@
-# ---- Core ----
+# ---- UI ----
 streamlit==1.49.1
-pydantic<2.8
-numpy
-pandas
 
-# ---- RAG stack ----
+# ---- Vector DB ----
 chromadb==0.5.5
-sentence-transformers>=2.7.0,<3.0
-# 如果你改用 BGE/FlagEmbedding，请移到这行并删掉上面的 sentence-transformers：
-# FlagEmbedding>=1.2.10
+pydantic<3
+numpy<2.0
+pysqlite3-binary==0.5.2.post3
 
-# ---- SQLite shim for cloud ----
-pysqlite3-binary==0.5.4
-
-# ---- Utils ----
-rich>=13.7,<15
+# ---- Embeddings (Torch ≥ 2.6 needed for CVE fix) ----
+sentence-transformers==3.0.1
+torch==2.6.0
+--extra-index-url https://download.pytorch.org/whl/cpu
