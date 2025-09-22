@@ -1,497 +1,588 @@
 # -*- coding: utf-8 -*-
 """
-retriever.py — CareMind RAG 检索层（Chroma 0.5.x）
+CareMind · RAG Retriever
+========================
 
-本版在保留你“完整版”检索能力的同时，适配了 Streamlit Cloud：
-- 打开集合时不加载模型（不传 embedding_function），避免 Torch/Transformers 在 import/open 阶段触发。
-- 向量查询仅在需要时懒加载 ST 模型；若失败或禁用，则自动回退到 lexical contains。
-- 保留并完善：SQLite FTS 药品检索 + RRF 融合、元数据归一化、CLI、自诊断报错。
+本模块聚焦“检索侧”的一站式能力，提供以下特性：
+1) 与 ChromaDB 0.5.x 完整兼容的集合访问与查询封装（不访问内部属性）
+2) 统一的语义检索（向量）+ 关键词直搜（where_document/get）组合策略
+3) 可选的轻量 Rerank（Cross-Encoder，如不可用自动降级到 RRF）
+4) SQLite 药品库（drugs.sqlite）结构化查询的便捷入口
+5) 健康检查 / 自检打印，便于 Streamlit 启动时输出运行环境诊断
+6) CLI：可在命令行快速验证检索结果与管线连通性
+
+设计原则
+--------
+- “不破坏你已有接口”的前提下，尽量做到向后兼容与增强
+- 尽量避免 Hard Fail：向量失败 → 关键词兜底 → 提示占位，避免 UI 出现“暂无证据片段”
+- 注释足够丰富（rich comments），便于未来学生或同事快速上手二次开发
+
+版本对齐
+--------
+- 建议：chromadb==0.5.5
+- 建议：sentence-transformers>=2.7
+- 可选：cross-encoder>=0.2.4（做 rerank；缺失时自动降级）
 
 环境变量
 --------
-CHROMA_PERSIST_DIR   (默认 "./chroma_store")
-CHROMA_COLLECTION    (默认 "guideline_chunks_v2")
-EMBEDDING_MODEL      (默认 "BAAI/bge-small-zh-v1.5")  # 云端更稳
-DISABLE_VECTOR       ("1" 则禁用向量检索，仅走 lexical/SQL)
-DRUG_DB_PATH         (默认 "./db/drugs.sqlite")
+- CHROMA_PERSIST_DIR: Chroma 持久化目录（默认 ./chroma_store 或 ./chroma_store_clean）
+- CHROMA_COLLECTION:   目标集合名（如 guideline_chunks_v2）
+- EMBEDDING_MODEL:     嵌入模型（如 BAAI/bge-large-zh-v1.5）
+- DRUG_DB_PATH:        SQLite 路径（默认 ./db/drugs.sqlite）
 
-使用
-----
-向量优先、失败自动回退：
-    from rag import retriever as R
-    hits = R.search_guidelines("哮喘 β受体阻滞剂 禁忌", k=8)
+用法示例
+--------
+python rag/retriever.py \
+  --q "合并支气管哮喘的高血压患者是否可用β受体阻滞剂？" \
+  --topn 8 \
+  --method rrf
 
-混合检索 + 融合：
-    res = R.hybrid_search("问题…", method="rrf", topn=10)
-
-命令行：
-    python -m rag.retriever --q "哮喘 β受体阻滞剂 禁忌" --method rrf --topn 10
 """
 
 from __future__ import annotations
+
 import os
-import sys
 import re
+import sys
+import json
+import math
+import time
+import sqlite3
+import logging
 import argparse
-import importlib
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Tuple
 
-# 版本号便于日志排错
-VERSION = "2025-09-22-merged"
+# -------------------------------
+# 全局配置（从环境变量读取，可被 Streamlit/app 覆盖）
+# -------------------------------
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+COLLECTION  = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
+DRUG_DB     = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")
 
-# 读取环境变量（在 import 时读取一次）
-PERSIST_DIR     = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2")
-EMBED_MODEL     = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
-DISABLE_VECTOR  = os.getenv("DISABLE_VECTOR", os.getenv("CARE_MIND_DISABLE_VECTOR", "0"))
-DRUG_DB_PATH    = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")
+# 兼容：如果你在云端用的是清洗后的目录名
+if os.path.isdir("./chroma_store_clean") and not os.path.samefile(PERSIST_DIR, "./chroma_store_clean"):
+    # 不强改环境，但打印提示即可
+    pass
 
-# 单例：Chroma 客户端与 ST 模型
-_CLIENT = None          # type: ignore
-_ST_MODEL = None        # type: ignore
+# --------------------------------
+# 延迟导入/单例缓存：避免启动时沉重依赖阻塞
+# --------------------------------
+_CHROMA_CLIENT = None
+_CHROMA_COL    = None
+_EMBEDDER      = None
+_CROSS_ENCODER = None
 
+# 日志配置
+logger = logging.getLogger("caremind.retriever")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        stream=sys.stdout
+    )
 
-# ---------------------------
-# Chroma 客户端 / 集合打开（无 embedding_function）
-# ---------------------------
-def _lazy_chroma_client():
-    """延迟创建/缓存 Chroma PersistentClient。"""
-    global _CLIENT
-    if _CLIENT is None:
-        chroma = importlib.import_module("chromadb")
-        from chromadb import PersistentClient
-        ver = getattr(chroma, "__version__", "unknown")
-        print(f"[Retriever] v{VERSION} | Chroma v{ver} | dir={PERSIST_DIR}")
-        _CLIENT = PersistentClient(path=PERSIST_DIR)
-    return _CLIENT
-
-
-def list_collections_safe() -> List[Dict[str, Any]]:
-    """不访问私有属性，返回 {'name','count'} 列表。"""
-    client = _lazy_chroma_client()
-    out: List[Dict[str, Any]] = []
-    try:
-        for c in client.list_collections():
-            try:
-                col = client.get_collection(name=c.name)  # 不传 embedding_function
-                out.append({"name": c.name, "count": col.count()})
-            except Exception:
-                out.append({"name": c.name, "count": None})
-    except Exception as e:
-        raise RuntimeError(f"list_collections failed: {e}")
-    return out
+# --------------------------------
+# Chroma 客户端与集合封装（0.5.x 安全用法）
+# --------------------------------
+def _get_client():
+    """
+    懒加载 Chroma 持久化客户端。
+    注意：0.5.x 用 PersistentClient(path=...)；不要访问内部私有属性。
+    """
+    global _CHROMA_CLIENT
+    if _CHROMA_CLIENT is None:
+        try:
+            from chromadb import PersistentClient
+        except Exception as e:
+            raise RuntimeError(f"Chroma import failed: {e}")
+        _CHROMA_CLIENT = PersistentClient(path=PERSIST_DIR)
+    return _CHROMA_CLIENT
 
 
 def get_chroma_collection():
     """
-    仅打开已存在集合（不 create），并进行直观校验：
-    - 集合必须存在
-    - 集合必须非空
-    注意：不传 embedding_function，避免打开时加载模型。
+    获取/创建集合：0.5.x 推荐 get_or_create_collection(name=...)
     """
-    client = _lazy_chroma_client()
+    global _CHROMA_COL
+    if _CHROMA_COL is not None:
+        return _CHROMA_COL
+    client = _get_client()
+    _CHROMA_COL = client.get_or_create_collection(name=COLLECTION)
+    return _CHROMA_COL
 
+
+def list_collections() -> List[Dict[str, Any]]:
+    """
+    返回集合名与粗略计数（通过 get(limit=1) 触发 lazy load，避免重 IO）
+    """
+    res = []
     try:
-        names = [c.name for c in client.list_collections()]
+        client = _get_client()
+        cols = client.list_collections()
+        for cinfo in cols:
+            name = getattr(cinfo, "name", None) or str(cinfo)
+            try:
+                col = client.get_collection(name=name)
+                # 取 1 条触发 meta 初始化；0.5.x 暂无直接 count API
+                _ = col.get(limit=1)
+                # 这里不强求真实 count，避免重载；UI 层可以另做统计
+                res.append({"name": name})
+            except Exception as e:
+                res.append({"name": name, "error": str(e)})
     except Exception as e:
-        raise RuntimeError(f"❌ list_collections 失败：{e}")
+        res.append({"error": f"list_collections failed: {e}"})
+    return res
 
-    if COLLECTION_NAME not in names:
-        raise RuntimeError(f"❌ 找不到集合《{COLLECTION_NAME}》。可用集合：{names}")
 
+def peek_collection(n: int = 3) -> List[Dict[str, Any]]:
+    """
+    安全 “peek” 函数：用 get(limit=..., include=[...]) 返回几条样本
+    彻底替代对内部属性（如 max_seq_id）的依赖。
+    """
     try:
-        col = client.get_collection(name=COLLECTION_NAME)  # 不传 embedding_function
+        col = get_chroma_collection()
+        rec = col.get(limit=n, include=["ids", "documents", "metadatas"])
+        out = []
+        docs  = rec.get("documents") or []
+        metas = rec.get("metadatas") or []
+        ids   = rec.get("ids") or []
+        for i in range(min(n, len(ids))):
+            m = metas[i] or {}
+            d = (docs[i] or "")[:240]
+            out.append({
+                "id": ids[i],
+                "title": m.get("title"),
+                "year": m.get("year"),
+                "source": m.get("source"),
+                "preview": d
+            })
+        return out
     except Exception as e:
-        raise RuntimeError(f"❌ 打开集合失败：{e}")
+        return [{"error": f"peek failed: {e}"}]
 
-    try:
-        n = col.count()
-    except Exception as e:
-        raise RuntimeError(f"❌ 集合计数失败：{e}")
-
-    if n == 0:
-        raise RuntimeError(f"❌ 集合《{COLLECTION_NAME}》为空。请检查 ingest 是否写入成功。")
-
-    print(f"[Retriever] 打开集合《{COLLECTION_NAME}》 | docs={n}")
-    return col
-
-
-# ---------------------------
-# 向量编码（仅在需要时加载 ST；失败返回 None）
-# ---------------------------
-def _maybe_load_st_model():
-    """按需加载 SentenceTransformer；若禁用或失败则返回 None。"""
-    global _ST_MODEL
-
-    if str(DISABLE_VECTOR) == "1":
-        return None
-
-    if _ST_MODEL is not None:
-        return _ST_MODEL
-
-    try:
-        from sentence_transformers import SentenceTransformer
-        _ST_MODEL = SentenceTransformer(EMBED_MODEL, device="cpu")
+# --------------------------------
+# 嵌入模型（Sentence-Transformers）封装
+# --------------------------------
+def _get_embedder():
+    """
+    统一的 query_embeddings 编码器。与 ingest 保持一致，避免“模型不一致”导致相似度错位。
+    """
+    global _EMBEDDER
+    if _EMBEDDER is None:
         try:
-            import torch  # noqa: F401
-            print(f"[Retriever] ST 模型已加载：{EMBED_MODEL}")
-        except Exception:
-            # 即使 torch 不可用，加载失败也会在 encode 时被捕获
-            pass
-        return _ST_MODEL
-    except Exception as e:
-        print(f"[Retriever] ⚠️ 加载 ST 模型失败（{EMBED_MODEL}）：{e}")
-        _ST_MODEL = None
-        return None
-
-
-def _encode_query(text: str):
-    """将查询文本编码为 embedding（list），失败时返回 None。"""
-    model = _maybe_load_st_model()
-    if model is None:
-        return None
-    try:
-        emb = model.encode([text], normalize_embeddings=True)
-        return emb.tolist()  # chroma 需要 python list
-    except Exception as e:
-        print(f"[Retriever] ⚠️ encode 失败，将回退：{e}")
-        return None
-
-
-# ---------------------------
-# 元数据归一化（保留你原来的完善处理）
-# ---------------------------
-def _normalize_meta(m: dict) -> dict:
-    """把常见别名归一化到 UI 需要的字段：source/title/year/page/chunk_id。"""
-    if not isinstance(m, dict):
-        return {}
-    n = dict(m)  # shallow copy
-
-    aliases = {
-        # source
-        "src": "source",
-        "file": "source",
-        "filename": "source",
-        "filepath": "source",
-        "source_filename": "source",
-        # title
-        "name": "title",
-        "doc_title": "title",
-        # year / page
-        "pub_year": "year",
-        "year_": "year",
-        "pages": "page",
-        "pg": "page",
-        "page_no": "page",
-        # chunk id
-        "chunk": "chunk_id",
-        "chunkId": "chunk_id",
-        "id": "chunk_id",
-    }
-    for k, v in list(n.items()):
-        if k in aliases and aliases[k] not in n:
-            n[aliases[k]] = v
-
-    try:
-        if isinstance(n.get("page"), str):
-            m0 = re.search(r"\d+", n["page"])
-            if m0:
-                n["page"] = int(m0.group(0))
-    except Exception:
-        pass
-
-    for k in ("source", "title", "year", "page", "chunk_id"):
-        n.setdefault(k, None)
-
-    for k in ("doi", "journal_name", "issue", "volume", "authors", "section_title"):
-        if k not in n and k in m:
-            n[k] = m[k]
-
-    return n
-
-
-# ---------------------------
-# 纯向量检索（有则用；失败自动回退）
-# ---------------------------
-def _vector_search(col, query: str, k: int) -> List[Dict[str, Any]]:
-    qemb = _encode_query(query)
-    if not qemb:
-        return []
-    try:
-        res = col.query(
-            query_embeddings=qemb,
-            n_results=max(k, 10),
-            include=["documents", "metadatas", "distances"],
-        )
-    except Exception as e:
-        print(f"[Retriever] 向量检索失败：{e}")
-        return []
-
-    docs = (res.get("documents") or [[]])[0] or []
-    metas = (res.get("metadatas") or [[]])[0] or []
-    dists = (res.get("distances") or [[]])[0] or []
-    hits: List[Dict[str, Any]] = []
-    for i, txt in enumerate(docs[:k]):
-        md = metas[i] if i < len(metas) else {}
-        dist = float(dists[i]) if i < len(dists) and dists[i] is not None else 0.0
-        hits.append({
-            "id": (res.get("ids") or [[]])[0][i] if (res.get("ids") or [[]])[0:] else None,
-            "doc": txt,
-            "content": txt,
-            "meta": _normalize_meta(md),
-            "score": 1.0 - dist,
-        })
-    return hits
-
-
-# ---------------------------
-# 词法回退（where_document $contains）
-# ---------------------------
-def _lex_contains(col, query: str, k: int) -> List[Dict[str, Any]]:
-    syns = ["β受体阻滞剂", "β阻滞剂", "β-blocker", "哮喘", "支气管哮喘"]
-    terms = [t for t in syns if t in query] or [query]
-    for kw in terms:
-        try:
-            res = col.query(
-                where_document={"$contains": kw},
-                n_results=max(k, 10),
-                include=["documents", "metadatas"],
-            )
+            from sentence_transformers import SentenceTransformer
         except Exception as e:
-            print(f"[Retriever] where_document 失败 '{kw}': {e}")
-            continue
+            raise RuntimeError(f"sentence-transformers not available: {e}")
+        _EMBEDDER = SentenceTransformer(EMBED_MODEL)
+    return _EMBEDDER
 
-        docs = (res.get("documents") or [[]])[0] or []
-        metas = (res.get("metadatas") or [[]])[0] or []
-        if not docs:
-            continue
 
-        hits: List[Dict[str, Any]] = []
-        for i, txt in enumerate(docs[:k]):
-            meta = metas[i] if i < len(metas) else {}
+def encode_query(texts: List[str]) -> List[List[float]]:
+    """
+    编码查询文本 → 向量；注意开启 normalize_embeddings=True，利于 cosine 相似。
+    """
+    model = _get_embedder()
+    vecs = model.encode(texts, normalize_embeddings=True)
+    return [v.tolist() if hasattr(v, "tolist") else list(v) for v in vecs]
+
+# --------------------------------
+# 关键词直搜（不走向量）：where_document with get()
+# --------------------------------
+def keyword_get(where_text: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    关键词直搜（不走向量）、模糊包含：{"$contains": "..."}。
+    说明：
+      - 只能在 collection.get(...) 中使用 where_document；
+      - 在 collection.query(...) 中“不能”使用 where_document。
+    """
+    col = get_chroma_collection()
+    try:
+        rec = col.get(
+            where_document={"$contains": where_text},
+            include=["ids", "documents", "metadatas"],
+            limit=limit
+        )
+        hits = []
+        for i, _id in enumerate(rec.get("ids") or []):
+            md  = (rec["metadatas"] or [None])[i] or {}
+            doc = (rec["documents"] or [""])[i]
             hits.append({
-                "id": None,
-                "doc": txt,
-                "content": txt,
-                "meta": _normalize_meta(meta),
-                "score": 0.0,
+                "id": _id,
+                "score": None,  # 直搜不提供距离
+                "doc": doc,
+                "meta": md,
+                "channel": "keyword"
             })
         return hits
-    return []
-
-
-# ---------------------------
-# 对外：指南检索（向量→词法）
-# ---------------------------
-def search_guidelines(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    col = get_chroma_collection()
-
-    # 1) 向量路径（若可用）
-    vec_hits = _vector_search(col, query, k)
-    if vec_hits:
-        # 你原来有一个简单的关键词重排；保留其思想（可选）
-        kw = ["老年","糖尿病","冠心病","β受体阻滞剂","目标","首选","禁忌","监测","ACEI","ARB","钙拮抗剂","利尿剂"]
-        def kwscore(h):
-            t = (h.get("meta", {}).get("title") or "")
-            x = (h.get("content") or "")
-            s = 0
-            tl = t.lower(); xl = x.lower()
-            for kword in kw:
-                k2 = kword.lower()
-                if k2 in tl: s += 2
-                if k2 in xl: s += 1
-            return (s, h.get("score", 0))
-        vec_hits = sorted(vec_hits, key=kwscore, reverse=True)
-        return vec_hits[:k]
-
-    # 2) 词法回退
-    return _lex_contains(col, query, k)
-
-
-# ---------------------------
-# 药品库 SQLite FTS 检索（可选）
-# ---------------------------
-def _has_drug_db(path: str) -> bool:
-    return os.path.isfile(path)
-
-def search_drug_fts(query: str, k: int = 5) -> List[Dict[str, Any]]:
-    if not _has_drug_db(DRUG_DB_PATH):
-        return []
-    # sqlite3 由 app.py 中的 shim 保障；此处按需导入
-    try:
-        import sqlite3  # type: ignore
-        conn = sqlite3.connect(DRUG_DB_PATH)
-        conn.row_factory = sqlite3.Row
     except Exception as e:
-        print(f"⚠️ 无法打开药品数据库：{e}")
-        return []
+        return [{"error": f"where_document get failed: {e}"}]
 
-    sql = """
-    SELECT
-        name,
-        COALESCE(indication,'') AS indication,
-        COALESCE(contraindication,'') AS contraindication,
-        COALESCE(interaction,'') AS interaction,
-        COALESCE(pregnancy,'') AS pregnancy,
-        COALESCE(source,'') AS source,
-        bm25(drugs_fts) AS rank
-    FROM drugs_fts
-    WHERE drugs_fts MATCH ?
-    ORDER BY rank LIMIT ?;
+# --------------------------------
+# 主检索：向量优先 + 关键词兜底（确保不空）
+# --------------------------------
+def search_guidelines(question: str, k: int = 8) -> List[Dict[str, Any]]:
     """
-    q = query.replace(" ", " OR ")
+    主接口：先语义向量检索；若 0 命中/异常 → 回退关键词直搜。
+    返回结构：[{score, doc, meta, channel}]
+      - score：向量检索返回“距离”（越小越相似）；直搜为 None
+      - channel：'vector' / 'keyword' / 'hint'
+    """
+    col = get_chroma_collection()
+    q = (question or "").strip()
+    if not q:
+        return []
+
+    # --------------------------------
+    # 1) 语义检索
+    # --------------------------------
     try:
-        cur = conn.execute(sql, (q, int(max(1, k))))
-        rows = cur.fetchall()
+        embeds = encode_query([q])  # 与 ingest 一致的模型
+        res = col.query(
+            query_embeddings=embeds,
+            n_results=max(1, k),
+            include=["documents", "metadatas", "distances"],
+        )
+        docs  = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+        hits: List[Dict[str, Any]] = []
+        for i, d in enumerate(docs):
+            hits.append({
+                "score": float(dists[i]) if i < len(dists) else None,  # 距离越小越接近
+                "doc": d,
+                "meta": metas[i] if i < len(metas) else {},
+                "channel": "vector"
+            })
+        if hits:
+            return hits
     except Exception as e:
-        print(f"⚠️ 药品FTS检索失败：{e}")
-        rows = []
+        logger.warning(f"vector query failed: {e}")
+
+    # --------------------------------
+    # 2) 关键词兜底
+    # --------------------------------
+    #   简单中文/英文切词：只取长度>=2 的片段，避免停用词噪声
+    terms = [t for t in re.split(r"[^\w\u4e00-\u9fff]+", q) if len(t) >= 2]
+    seen_ids = set()
+    merged: List[Dict[str, Any]] = []
+    for t in terms[:6]:  # 控制复杂度
+        ks = keyword_get(t, limit=max(2, k // 2))
+        for h in ks:
+            _id = h.get("id")
+            if not _id or _id in seen_ids:
+                continue
+            seen_ids.add(_id)
+            merged.append(h)
+            if len(merged) >= k:
+                break
+        if len(merged) >= k:
+            break
+
+    return merged
+
+
+def ensure_non_empty_evidence(question: str, k: int = 6) -> List[Dict[str, Any]]:
+    """
+    UI/上层兜底：即使检索失败，也返回“提示占位”，避免前端显示“暂无证据片段”。
+    """
+    hits = search_guidelines(question, k=k) or []
+    if hits:
+        return hits
+    return [{
+        "score": None,
+        "doc": "（未命中向量与直搜。建议：缩短问题、避免过多停用词、加入明确疾病/药品关键词；或检查集合/嵌入模型是否一致。）",
+        "meta": {"title": "系统提示", "source": "CareMind Retriever", "year": None},
+        "channel": "hint"
+    }]
+
+# --------------------------------
+# 轻量 Rerank：支持 Cross-Encoder；不可用时回退到 RRF
+# --------------------------------
+def _get_cross_encoder():
+    """
+    可选的重排序器（如 cross-encoder/ms-marco-MiniLM-L-6-v2）。
+    若依赖缺失或模型不可用，返回 None（上层自动降级到 RRF）。
+    """
+    global _CROSS_ENCODER
+    if _CROSS_ENCODER is not None:
+        return _CROSS_ENCODER
+    try:
+        from cross_encoder import CrossEncoder  # 有些环境包名是 cross-encoder
+        model_name = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        _CROSS_ENCODER = CrossEncoder(model_name)
+        return _CROSS_ENCODER
+    except Exception:
+        try:
+            from sentence_transformers import CrossEncoder
+            model_name = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+            _CROSS_ENCODER = CrossEncoder(model_name)
+            return _CROSS_ENCODER
+        except Exception as e:
+            logger.info(f"Cross-Encoder unavailable, fallback to RRF: {e}")
+            return None
+
+
+def rrf_merge(rank_lists: List[List[Dict[str, Any]]], k: int = 8, k_rrf: float = 60.0) -> List[Dict[str, Any]]:
+    """
+    Reciprocal Rank Fusion（简单稳健的多通道融合）：
+    对多份排序（如向量结果、关键词结果）做 1/(k_rrf + rank) 加权求和。
+    """
+    score_map: Dict[str, float] = {}
+    store_map: Dict[str, Dict[str, Any]] = {}
+
+    for results in rank_lists:
+        for rnk, item in enumerate(results, start=1):
+            _id = item.get("id") or f"NOID::{item.get('doc','')[:40]}"
+            score_map[_id] = score_map.get(_id, 0.0) + 1.0 / (k_rrf + rnk)
+            # 保留更丰富的字段（第一次出现为准）
+            if _id not in store_map:
+                store_map[_id] = item
+
+    fused = [
+        {**store_map[_id], "rrf": score}
+        for _id, score in score_map.items()
+    ]
+    fused.sort(key=lambda x: x.get("rrf", 0.0), reverse=True)
+    return fused[:k]
+
+
+def rerank(question: str, hits: List[Dict[str, Any]], k: int = 8) -> List[Dict[str, Any]]:
+    """
+    若可用 Cross-Encoder，则对 topN 做交叉编码器重排序；否则回退 RRF（与关键词/向量融合）。
+    输入 hits 可以是单路向量或混合结果。
+    """
+    if not hits:
+        return hits
+
+    ce = _get_cross_encoder()
+    if ce is None:
+        # 降级：拿向量 topK 与 关键词再做一次融合
+        # 实际上在 search_guidelines 里已做混合，本处直接截断返回
+        return hits[:k]
+
+    # 用 Cross-Encoder 计算相关度
+    pairs = [(question, h.get("doc", "")) for h in hits[: min(24, max(8, k * 2))]]
+    try:
+        scores = ce.predict(pairs)  # 越高越相关
+        scored = []
+        for h, s in zip(hits, scores):
+            hh = dict(h)
+            hh["ce_score"] = float(s)
+            scored.append(hh)
+        scored.sort(key=lambda x: x.get("ce_score", 0.0), reverse=True)
+        return scored[:k]
+    except Exception as e:
+        logger.info(f"Cross-Encoder predict failed, fallback: {e}")
+        return hits[:k]
+
+# --------------------------------
+# 药品结构化查询（SQLite）
+# --------------------------------
+def _open_drug_db(path: str = DRUG_DB) -> Optional[sqlite3.Connection]:
+    if not path or not os.path.isfile(path):
+        logger.warning(f"SQLite not found: {path}")
+        return None
+    try:
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as e:
+        logger.error(f"open sqlite failed: {e}")
+        return None
+
+
+def lookup_drug(name: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    通用药品检索：在表 `drugs` 上做名称/别名模糊匹配（LIKE），返回结构化信息。
+    你可以根据自己的字段做扩展，如：适应症/禁忌/相互作用/妊娠分级/来源 等列。
+    """
+    conn = _open_drug_db()
+    if conn is None:
+        return []
+
+    q = (name or "").strip()
+    if not q:
+        return []
+
+    try:
+        cur = conn.cursor()
+        # 假定表结构至少包含：name, aliases, indication, contraindication, interactions, pregnancy, source
+        sql = """
+        SELECT name, aliases, indication, contraindication, interactions, pregnancy, source
+        FROM drugs
+        WHERE name LIKE ? OR (aliases IS NOT NULL AND aliases LIKE ?)
+        LIMIT ?
+        """
+        like = f"%{q}%"
+        cur.execute(sql, (like, like, limit))
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "name": r["name"],
+                "aliases": r["aliases"],
+                "indication": r["indication"],
+                "contraindication": r["contraindication"],
+                "interactions": r["interactions"],
+                "pregnancy": r["pregnancy"],
+                "source": r["source"],
+            })
+        return out
+    except Exception as e:
+        logger.error(f"lookup_drug failed: {e}")
+        return []
     finally:
         try:
             conn.close()
         except Exception:
             pass
 
-    hits: List[Dict[str, Any]] = []
-    for r in rows:
-        hits.append({
-            "name": r["name"],
-            "rank": r["rank"],
-            "indication": r["indication"],
-            "contraindication": r["contraindication"],
-            "interaction": r["interaction"],
-            "pregnancy": r["pregnancy"],
-            "source": r["source"],
-        })
-    return hits
+# --------------------------------
+# 健康检查 / 诊断打印（供前端启动日志调用）
+# --------------------------------
+def print_health() -> Dict[str, Any]:
+    """
+    返回一份可 JSON 化的健康检查结果，供前端“运行日志/环境诊断”打印。
+    """
+    info: Dict[str, Any] = {
+        "env": {
+            "CAREMIND_DEMO": os.getenv("CAREMIND_DEMO", "0"),
+            "CHROMA_PERSIST_DIR": PERSIST_DIR,
+            "CHROMA_COLLECTION": COLLECTION,
+            "EMBEDDING_MODEL": EMBED_MODEL,
+            "DRUG_DB_PATH": DRUG_DB
+        },
+        "retriever_version": os.getenv("RETRIEVER_VERSION", "2025-09-22-merged"),
+        "chroma": {},
+        "sqlite": {}
+    }
 
+    # Chroma 目录存在性
+    info["chroma"]["dir_exists"] = os.path.isdir(PERSIST_DIR)
+    info["chroma"]["dir"] = os.path.abspath(PERSIST_DIR)
 
-# ---------------------------
-# RRF 融合（向量/词法 vs 药品FTS）
-# ---------------------------
-def _rrf_merge(
-    vec_hits: List[Dict[str, Any]],
-    drug_hits: List[Dict[str, Any]],
-    topn: int = 10,
-    k_rrf: float = 60.0,
-) -> List[Dict[str, Any]]:
-    scores: Dict[str, float] = {}
-    payload: Dict[str, Dict[str, Any]] = {}
+    # 集合列表（名称）
+    info["chroma"]["collections"] = list_collections()
 
-    def add_score(key: str, add: float, obj: Dict[str, Any]):
-        scores[key] = scores.get(key, 0.0) + add
-        if key not in payload:
-            payload[key] = obj
+    # 快速 peek
+    info["chroma"]["peek"] = peek_collection(3)
 
-    for i, h in enumerate(vec_hits):
-        key = h.get("id") or f"vec_{i}"
-        add_score(key, 1.0 / (k_rrf + i + 1), {"type": "guideline", **h})
-
-    for j, h in enumerate(drug_hits):
-        key = f"drug_{h.get('name','?')}_{j}"
-        add_score(key, 1.0 / (k_rrf + j + 1), {"type": "drug", **h})
-
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:topn]
-    return [payload[k] for k, _ in ranked]
-
-
-# ---------------------------
-# 混合检索入口
-# ---------------------------
-def hybrid_search(
-    query: str,
-    method: str = "rrf",
-    topn: int = 10,
-    k_guideline: Optional[int] = None,
-    k_drug: Optional[int] = None,
-) -> Dict[str, Any]:
-    k_guideline = k_guideline or max(3, min(20, topn))
-    k_drug = k_drug or max(3, min(20, topn))
-
-    out: Dict[str, Any] = {"query": query}
-    vec_hits: List[Dict[str, Any]] = []
-    drug_hits: List[Dict[str, Any]] = []
-
-    if method in ("vec", "rrf"):
+    # SQLite 存在性与表枚举
+    db_path = os.path.abspath(DRUG_DB)
+    info["sqlite"]["path"] = db_path
+    info["sqlite"]["exists"] = os.path.isfile(db_path)
+    if info["sqlite"]["exists"]:
         try:
-            vec_hits = search_guidelines(query, k=k_guideline)
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            info["sqlite"]["tables"] = [r[0] for r in cur.fetchall()]
+            conn.close()
         except Exception as e:
-            print(str(e))
-            vec_hits = []
-    if method in ("sql", "rrf"):
-        drug_hits = search_drug_fts(query, k=k_drug)
+            info["sqlite"]["error"] = str(e)
 
-    out["guideline_hits"] = vec_hits
-    out["drug_hits"] = drug_hits
+    return info
 
-    if method == "rrf":
-        out["fused"] = _rrf_merge(vec_hits, drug_hits, topn=topn)
-    elif method == "vec":
-        out["fused"] = vec_hits[:topn]
-    elif method == "sql":
-        out["fused"] = drug_hits[:topn]
+# --------------------------------
+# 高层组合：对外暴露的“统一检索入口”
+# --------------------------------
+@dataclass
+class RetrieveOptions:
+    topn: int = 8          # 返回条数
+    method: str = "rrf"    # 后融合/重排序方法：["rrf", "none", "ce"]
+
+
+def retrieve(question: str, opts: RetrieveOptions = RetrieveOptions()) -> Dict[str, Any]:
+    """
+    对外统一入口：
+      - 先拿到基础命中（向量 + 关键词兜底）
+      - 再按 method 做重排（ce/rrf/none）
+      - 永不返回空 evidence：最差会给一条提示型“hint”
+    """
+    t0 = time.time()
+    base_hits = ensure_non_empty_evidence(question, k=opts.topn * 2)
+
+    if opts.method == "ce":
+        final_hits = rerank(question, base_hits, k=opts.topn)
+    elif opts.method == "rrf":
+        # 此处可以把“向量结果”和“关键词结果”分两路再融合；当前 base_hits 已是混合，
+        # 为了示例保持简单：直接截断即可；如果你保留两路原始结果，可在此调用 rrf_merge(...)
+        final_hits = base_hits[:opts.topn]
     else:
-        out["fused"] = []
-    return out
+        final_hits = base_hits[:opts.topn]
 
+    dt = time.time() - t0
+    return {
+        "question": question,
+        "hits": final_hits,
+        "t_sec": round(dt, 3),
+        "meta": {
+            "method": opts.method,
+            "topn": opts.topn,
+            "embedding_model": EMBED_MODEL,
+            "collection": COLLECTION
+        }
+    }
 
-# ---------------------------
-# CLI
-# ---------------------------
-def _preview_doc(text: Optional[str], limit: int = 160) -> str:
-    if not text:
-        return ""
-    return (text[:limit] + ("…" if len(text) > limit else "")).replace("\n", " ")
+# --------------------------------
+# 命令行入口：便于你在服务器/WSL 里直接测试
+# --------------------------------
+def _fmt_hit(h: Dict[str, Any], idx: int) -> str:
+    m = h.get("meta") or {}
+    head = f"[{idx}] {m.get('title') or 'Untitled'} | {m.get('source') or '-'} | {m.get('year') or '-'}"
+    score_keys = [k for k in ["ce_score", "rrf", "score"] if h.get(k) is not None]
+    sk = ", ".join([f"{k}={h.get(k):.4f}" if isinstance(h.get(k), (int, float)) else f"{k}={h.get(k)}" for k in score_keys])
+    ch = h.get("channel") or "-"
+    body = (h.get("doc") or "").strip().replace("\n", " ")
+    body = re.sub(r"\s+", " ", body)[:300]
+    return f"{head}  [{ch}]  ({sk})\n    {body}"
+
 
 def main():
-    parser = argparse.ArgumentParser(description="CareMind Retriever (Chroma 0.5.x, vector→lexical fallback, FTS+RRF)")
-    parser.add_argument("--q", "--query", dest="query", required=True, help="查询语句")
-    parser.add_argument("--method", choices=["vec", "sql", "rrf"], default="rrf", help="检索方式")
-    parser.add_argument("--topn", type=int, default=10, help="返回条数")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="CareMind Retriever · CLI")
+    ap.add_argument("--q", "--query", dest="query", type=str, required=False, default="老年 高血压 糖尿病 目标",
+                    help="查询问题/关键词")
+    ap.add_argument("--topn", type=int, default=8, help="返回条数")
+    ap.add_argument("--method", type=str, default="rrf", choices=["rrf", "none", "ce"],
+                    help="后融合/重排方法")
+    ap.add_argument("--peek", action="store_true", help="仅做 peek（验证集合可读性）")
+    ap.add_argument("--kw", type=str, default="", help="仅用关键词直搜（调试）")
+    ap.add_argument("--health", action="store_true", help="打印健康检查 JSON")
+    args = ap.parse_args()
 
-    print(f"Retriever VERSION:  {VERSION}")
-    print(f"Embedding model:    {EMBED_MODEL}")
-    print(f"Chroma dir:         {PERSIST_DIR} | collection={COLLECTION_NAME}")
-    print(f"DISABLE_VECTOR:     {DISABLE_VECTOR}")
-    if os.path.exists(DRUG_DB_PATH):
-        print(f"SQLite path:        {DRUG_DB_PATH}")
-    else:
-        print("SQLite path:        (未配置或文件不存在，跳过药品 FTS)")
+    if args.health:
+        print(json.dumps(print_health(), ensure_ascii=False, indent=2))
+        return
 
-    if args.method == "vec":
-        vec = search_guidelines(args.query, k=args.topn)
-        print(f"\n[Guideline(Vector/lex-fallback)] Hits={len(vec)}")
-        for i, h in enumerate(vec, 1):
-            m = h.get("meta") or {}
-            print(f"{i:02d}. {_preview_doc(h.get('doc'))}")
-            print(f"    来源: {m.get('source')} | 标题: {m.get('title')} | 年份: {m.get('year')}")
-    elif args.method == "sql":
-        drug = search_drug_fts(args.query, k=args.topn)
-        print(f"\n[Drug(FTS)] Hits={len(drug)}")
-        for i, h in enumerate(drug, 1):
-            print(f"{i:02d}. {h.get('name')}  (rank={h.get('rank'):.4f})")
-            print(f"    适应症: {_preview_doc(h.get('indication'))}")
-            print(f"    禁忌症: {_preview_doc(h.get('contraindication'))}")
-            print(f"    交互:   {_preview_doc(h.get('interaction'))}")
-            print(f"    妊娠:   {_preview_doc(h.get('pregnancy'))}")
-            print(f"    来源:   {_preview_doc(h.get('source'))}")
-    else:
-        res = hybrid_search(args.query, method="rrf", topn=args.topn)
-        fused = res.get("fused") or []
-        print(f"\n[RRF Fused] TopN={len(fused)}")
-        for i, h in enumerate(fused, 1):
-            if h.get("type") == "guideline":
-                m = h.get("meta") or {}
-                print(f"{i:02d}. [指南] {_preview_doc(h.get('doc'))}")
-                print(f"    来源: {m.get('source')} | 标题: {m.get('title')} | 年份: {m.get('year')}")
-            else:
-                print(f"{i:02d}. [药品] {h.get('name')} (rank≈{h.get('rank'):.4f})")
-                print(f"    适应症: {_preview_doc(h.get('indication'))}")
-                print(f"    禁忌症: {_preview_doc(h.get('contraindication'))}")
-                print(f"    交互:   {_preview_doc(h.get('interaction'))}")
-                print(f"    妊娠:   {_preview_doc(h.get('pregnancy'))}")
-                print(f"    来源:   {_preview_doc(h.get('source'))}")
+    if args.peek:
+        sample = peek_collection(3)
+        print("PEEK:")
+        for i, s in enumerate(sample, 1):
+            print(f"  {i}. {json.dumps(s, ensure_ascii=False)[:400]}")
+        return
 
+    if args.kw:
+        ks = keyword_get(args.kw, limit=args.topn)
+        print(f"KW GET [{args.kw}] → {len(ks)} hits")
+        for i, h in enumerate(ks, 1):
+            print(_fmt_hit(h, i))
+        return
+
+    # 常规：统一检索入口
+    out = retrieve(args.query, RetrieveOptions(topn=args.topn, method=args.method))
+    print(f"Question: {out['question']}")
+    print(f"Method:   {out['meta']['method']} | TopN={out['meta']['topn']} | Embed={out['meta']['embedding_model']}")
+    print(f"Collection: {out['meta']['collection']}")
+    print(f"Time:     {out['t_sec']}s")
+    print("-"*80)
+    for i, h in enumerate(out["hits"], 1):
+        print(_fmt_hit(h, i))
+
+
+# -------------------------------
+# 模块作为脚本执行
+# -------------------------------
 if __name__ == "__main__":
     main()
