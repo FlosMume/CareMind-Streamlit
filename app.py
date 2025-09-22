@@ -30,6 +30,18 @@ from rag import retriever as R              # 供诊断面板使用（读取常�
 # =============================================================================
 # 0) 辅助函数 / Helpers
 # -----------------------------------------------------------------------------
+=======
+try:
+    import pysqlite3  # noqa: F401
+    import sys
+    sys.modules["sqlite3"] = __import__("pysqlite3")
+except Exception:
+    pass
+
+# ---------------------------
+# 小工具
+# ---------------------------
+>>>>>>> a6a9edc (在顶部（所有 chromadb/sqlite3 被导入之前）加入 sqlite shim)
 def _env(key: str, default: str | None = None) -> str | None:
     """
     Secrets-aware env reader:
