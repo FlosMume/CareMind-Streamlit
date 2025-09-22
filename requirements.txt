@@ -2,12 +2,19 @@
 streamlit==1.49.1
 
 # ---- Vector DB ----
-chromadb==0.5.5
 pydantic<3
 numpy<2.0
-pysqlite3-binary==0.5.2.post3
 
-# ---- (可选) 查询向量编码：如果你的检索在运行时需要编码查询文本，保留下面两行 ----
-sentence-transformers==3.0.1
 torch==2.6.0
 --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Chroma 与其依赖
+chromadb==0.5.5
+
+# 用来提供新版本 sqlite3（适配 Python 3.10 在 Streamlit Cloud）
+pysqlite3-binary==0.5.2.post3
+
+# 向量与重排（按需）
+sentence-transformers>=2.7.0
+# cross-encoder 可选：如果你用 CE 重排，就加；否则可注释
+# cross-encoder>=0.2.4
