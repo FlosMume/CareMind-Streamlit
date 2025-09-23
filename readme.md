@@ -46,29 +46,36 @@ caremind-streamlit/
 ├── requirements.txt        # Python dependencies
 └── .streamlit/config.toml  # Streamlit UI configuration
 ```
+
 ## ⚙️ Installation
 ```
+
 1. Clone the repository
 git clone https://github.com/<your-username>/caremind-streamlit.git
 cd caremind-streamlit
+
 2. Create environment
 conda create -n caremind python=3.10 -y
 conda activate caremind
 pip install -r requirements.txt
+
 3. Set environment variables
 export CHROMA_PERSIST_DIR=./chroma_store
 export CHROMA_COLLECTION=guideline_chunks_1024_v2
 export EMBEDDING_MODEL=BAAI/bge-large-zh-v1.5
+
 4. Build the vector DB
 python ingest/create_db.py \
   --in data/guidelines.parsed.jsonl \
   --collection $CHROMA_COLLECTION
+
 5. Run Streamlit
 streamlit run app.py
 The app will be available at http://localhost:8501.
 ```
 ## 🌐 Deployment
 ```
+
 Local: Works on Windows/WSL + GPU (RTX 4070 SUPER tested)
 
 Streamlit Cloud:
@@ -96,6 +103,16 @@ All outputs include compliance disclaimers.
 
  Paper publication on clinical RAG systems
 ```
+## 🤝 Contribution
+```
+Pull requests are welcome.
+For major changes, please open an issue first to discuss.
+```
+## 📜 License
+```
+MIT License © 2025 Samuel Huang
+```
+
 ## 🤝 Contribution
 ```
 Pull requests are welcome.
