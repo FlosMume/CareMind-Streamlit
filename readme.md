@@ -49,31 +49,21 @@ caremind-streamlit/
 ## ⚙️ Installation
 ```
 1. Clone the repository
-bash
-Copy code
 git clone https://github.com/<your-username>/caremind-streamlit.git
 cd caremind-streamlit
 2. Create environment
-bash
-Copy code
 conda create -n caremind python=3.10 -y
 conda activate caremind
 pip install -r requirements.txt
 3. Set environment variables
-bash
-Copy code
 export CHROMA_PERSIST_DIR=./chroma_store
 export CHROMA_COLLECTION=guideline_chunks_1024_v2
 export EMBEDDING_MODEL=BAAI/bge-large-zh-v1.5
 4. Build the vector DB
-bash
-Copy code
 python ingest/create_db.py \
   --in data/guidelines.parsed.jsonl \
   --collection $CHROMA_COLLECTION
 5. Run Streamlit
-bash
-Copy code
 streamlit run app.py
 The app will be available at http://localhost:8501.
 ```
