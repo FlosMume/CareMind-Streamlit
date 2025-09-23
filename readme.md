@@ -45,7 +45,9 @@ caremind-streamlit/
 ├── chroma_store/           # Vector DB persistence (local / demo branch)
 ├── requirements.txt        # Python dependencies
 └── .streamlit/config.toml  # Streamlit UI configuration
+```
 ## ⚙️ Installation
+```
 1. Clone the repository
 bash
 Copy code
@@ -74,8 +76,9 @@ bash
 Copy code
 streamlit run app.py
 The app will be available at http://localhost:8501.
-
+```
 ## 🌐 Deployment
+```
 Local: Works on Windows/WSL + GPU (RTX 4070 SUPER tested)
 
 Streamlit Cloud:
@@ -83,13 +86,16 @@ Streamlit Cloud:
 main branch: minimal demo (no full dataset)
 
 demo-data branch: full dataset (≈ 18MB SQLite + 17MB Chroma index)
+```
 
 ## 🛡️ Compliance & Disclaimer
+```
 This tool is for research and demonstration purposes only.
 It does not replace professional medical judgment.
 All outputs include compliance disclaimers.
-
+```
 ## 📌 Roadmap
+```
  Improve evidence ranking with rerankers
 
  Enhance prompt templates for structured outputs
@@ -99,10 +105,13 @@ All outputs include compliance disclaimers.
  Multi-user demo via Docker or Cloud Run
 
  Paper publication on clinical RAG systems
-
+```
 ## 🤝 Contribution
+```
 Pull requests are welcome.
 For major changes, please open an issue first to discuss.
-
+```
 ## 📜 License
+```
 MIT License © 2025 Samuel Huang
+```
