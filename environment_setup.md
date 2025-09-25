@@ -109,21 +109,20 @@ python ingest/create_db.py \
 For Streamlit Cloud, use prebuilt data (demo-data branch).
 ```
 ## 7. Run the App
-```
-Local run:
 
-streamlit run app.py
+### Local run:
+
+* streamlit run app.py
 
 
-Streamlit Cloud:
+### Streamlit Cloud:
 
-Push branch to GitHub.
+1 Push branch to GitHub.
 
-Connect repo on streamlit.io
-.
+2 Connect repo on streamlit.io.
 
-Set Secrets for environment variables if needed.
-```
+3 Set Secrets for environment variables if needed.
+
 ## 8. Troubleshooting
 ```
 Issue: pysqlite3 errors on Streamlit Cloud
