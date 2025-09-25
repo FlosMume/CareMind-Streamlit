@@ -124,8 +124,10 @@ For Streamlit Cloud, use prebuilt data (demo-data branch).
 3 Set Secrets for environment variables if needed.
 
 ## 8. Troubleshooting
+
+#### Issue: 
 ```
-Issue: pysqlite3 errors on Streamlit Cloud
+pysqlite3 errors on Streamlit Cloud
 → Ensure pysqlite3-binary is in requirements.txt and aliased in retriever.py.
 
 GPU memory errors
