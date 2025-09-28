@@ -1,0 +1,36 @@
+caremind/
+├── docs/
+│   ├── 00_README.md                  # Entry point for documentation, links to all subdocs
+│   │
+│   ├── vision_scope/
+│   │   ├── project_proposal.md       # Problem statement, goals, value
+│   │   ├── scope_limitations.md      # MVP boundaries, exclusions
+│   │
+│   ├── technical/
+│   │   ├── architecture.md           # System diagram + component explanation
+│   │   ├── environment_setup.md      # Setup guide (CUDA, conda env, requirements.txt)
+│   │   ├── data_ingestion.md         # How guidelines/drugs DB are processed
+│   │   ├── code_reference/
+│   │   │   ├── retriever_notes.md    # Commented retriever.py
+│   │   │   ├── pipeline_notes.md     # Commented pipeline.py
+│   │   │   ├── app_notes.md          # Commented app.py
+│   │   ├── testing_validation.md     # How to run tests, sample queries
+│   │
+│   ├── clinical_compliance/
+│   │   ├── evidence_sources.md       # List of guidelines/databases + citations
+│   │   ├── compliance_disclaimer.md  # For demo/research only, regulatory notes
+│   │
+│   ├── operations/
+│   │   ├── deployment_local.md       # Run locally with GPU
+│   │   ├── deployment_cloud.md       # Streamlit Cloud (demo-data branch)
+│   │   ├── user_guide_demo.md        # Step-by-step demo instructions with screenshots
+│   │
+│   ├── strategy_academic/
+│   │   ├── project_summary.md        # One-pager for collaborators/partners
+│   │   ├── research_outline.md       # Draft academic paper outline
+│   │   ├── roadmap.md                # Future evolution (MVP → product → publication)
+│   │
+│   └── assets/
+│       ├── diagrams/                 # PNG/SVG of system diagrams
+│       ├── screenshots/              # UI demo screenshots
+│       └── logos/                    # Any branding/logo
