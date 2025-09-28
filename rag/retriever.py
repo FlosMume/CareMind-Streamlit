@@ -154,6 +154,7 @@ def get_chroma_client():
 
     settings = Settings(anonymized_telemetry=False)
 
+
     def _make_client(explicit_td: bool = False):
         if explicit_td:
             # 显式 tenant/database，有些环境下能避免“tenant 不存在”的校验失败
@@ -162,6 +163,213 @@ def get_chroma_client():
                 settings=settings,
                 tenant="default_tenant",
                 database="default_database",
+
+# =============================================================================
+# 4) 指南检索（Chroma）/ Guideline search (Chroma)
+# -----------------------------------------------------------------------------
+def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
+    """
+    使用 Chroma 进行语义检索；返回 [{"content": 文本, "meta": 元数据}, ...]
+    Semantic search via Chroma; returns [{"content": str, "meta": dict}, ...].
+
+    Parameters
+    ----------
+    query : str
+        临床问题（中/英均可） / clinical question (cn/en ok)
+    k : int
+        返回的片段数量 / number of results to return
+    """
+    try:
+        # 1) 获取客户端、嵌入函数与设置 / Client + embedding fn + settings
+        PersistentClient, embedding_functions, Settings = _chroma()
+
+        # 关闭匿名遥测并允许 reset（在临时/容器环境更安全）
+        # Disable anonymized telemetry & allow_reset for ephemeral environments
+        client = PersistentClient(
+            path=CHROMA_PERSIST_DIR,
+            settings=Settings(
+                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,  # False ⇒ disable telemetry
+                allow_reset=True,
+            ),
+        )
+
+        # 2) 绑定集合（若不存在则创建）/ Bind the collection (create if missing)
+        embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=EMBED_MODEL
+        )
+        collection = client.get_or_create_collection(
+            name=CHROMA_COLLECTION,
+            embedding_function=embed_fn,
+        )
+
+        # 3) 查询 / Query
+        res = collection.query(
+            query_texts=[query],
+            n_results=int(k),
+            include=["documents", "metadatas"],
+        )
+
+        # 4) 结果整形 / Shape results
+        docs  = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        return [{"content": d, "meta": m} for d, m in zip(docs, metas)]
+
+    except Exception as e:
+        # 失败时温和降级：打印日志并返回空列表（由上层决定如何回退）
+        # Soft-degrade: log & return [], letting pipeline decide a fallback/demo.
+        print("[retriever] search_guidelines error:", e)
+        return []
+
+
+# =============================================================================
+# 5) 列出集合（用于诊断面板）/ List collections for diagnostics
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# SQLite-level fallback to discover collections (diagnostics only)
+def _fallback_collections_from_sqlite_dir(dir_path: str):
+    """Read {dir}/chroma.sqlite3 or *.sqlite* and fetch collection names.
+    This is ONLY used for diagnostics when client.list_collections() fails
+    (e.g., due to serialization of internal fields like `_type`)."""
+    try:
+        import glob, sqlite3 as _sq, os as _os
+        candidates = []
+        p1 = _os.path.join(dir_path, "chroma.sqlite3")
+        if _os.path.exists(p1):
+            candidates.append(p1)
+        candidates.extend(glob.glob(_os.path.join(dir_path, "*.sqlite*")))
+        names, seen = [], set()
+        for fp in candidates:
+            con = None
+            try:
+                con = _sq.connect(fp)
+                cur = con.cursor()
+                cur.execute("SELECT name FROM collections")
+                for (nm,) in cur.fetchall():
+                    if nm and nm not in seen:
+                        seen.add(nm); names.append(nm)
+            except Exception:
+                pass
+            finally:
+                try:
+                    con and con.close()
+                except Exception:
+                    pass
+            if names:
+                break
+        return names
+    except Exception:
+        return []
+
+def list_collections_safe() -> List[Dict[str, Any]]:
+    """
+    安全地列出 Chroma 集合名称与条目数，避免把内部对象（含 `_type`）直接序列化。
+    Safely list Chroma collections with document counts, avoiding serialization of
+    internal objects (which may include `_type` and cause UI dump errors).
+    """
+    try:
+        PersistentClient, _, Settings = _chroma()
+        client = PersistentClient(
+            path=CHROMA_PERSIST_DIR,
+            settings=Settings(
+                anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
+                allow_reset=True,
+            ),
+        )
+
+        out: List[Dict[str, Any]] = []
+        for c in client.list_collections():
+            # c 可能是一个带内部元数据的对象；只提取可序列化字段
+            # `c` may carry non-serializable fields; extract only safe fields.
+            name = getattr(c, "name", None) or "?"
+            try:
+                # 一些后端支持 c.count()；如不支持则以 1 条查询作为探针
+                # Some backends support c.count(); if not, probe with 1-result query
+                count = int(c.count())
+            except Exception:
+                try:
+                    col = client.get_collection(name=name)
+                    q = col.query(query_texts=["."], n_results=1)
+                    ids = q.get("ids", [[]])[0]
+                    count = len(ids)
+                except Exception as e:
+                    count = f"error: {e}"
+            out.append({"name": name, "count": count})
+        return out
+
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# =============================================================================
+# 6) 药品结构化检索（SQLite）/ Structured drug lookup (SQLite)
+# -----------------------------------------------------------------------------
+def _connect_sqlite(path: str) -> sqlite3.Connection:
+    """
+    打开 SQLite 连接，Row 工厂方便以 dict-like 访问列。
+    Open SQLite connection with Row factory for dict-like column access.
+    """
+    if not os.path.exists(path):
+        if DEMO:
+            # 演示模式：使用内存库避免崩溃（无表即无结果）
+            # Demo mode: in-memory DB to avoid crashes (no tables ⇒ no results).
+            con = sqlite3.connect(":memory:")
+            con.row_factory = sqlite3.Row
+            return con
+        raise FileNotFoundError(f"SQLite DB not found: {path}")
+
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
+    """
+    模糊检索药品信息（示例字段）；返回 dict 或 None。
+    Fuzzy lookup of a drug (example fields); returns dict or None.
+
+    假定表结构 / Assumed schema:
+      CREATE TABLE drugs (
+          id INTEGER PRIMARY KEY,
+          name TEXT, generic_name TEXT,
+          indications TEXT, contraindications TEXT,
+          interactions TEXT, pregnancy TEXT, source TEXT
+      )
+    """
+    name = (drug_name or "").strip()
+    if not name:
+        return None
+
+    con = _connect_sqlite(DRUG_DB_PATH)
+    try:
+        cur = con.cursor()
+
+        # 1) 近似精确匹配 / Near-exact match first
+        cur.execute(
+            """
+            SELECT name, generic_name, indications, contraindications,
+                   interactions, pregnancy, source
+            FROM drugs
+            WHERE name = ? OR generic_name = ?
+            LIMIT 1
+            """,
+            (name, name),
+        )
+        row = cur.fetchone()
+
+        # 2) LIKE 模糊匹配 / Fallback to LIKE fuzzy search
+        if not row:
+            kw = f"%{name}%"
+            cur.execute(
+                """
+                SELECT name, generic_name, indications, contraindications,
+                       interactions, pregnancy, source
+                FROM drugs
+                WHERE name LIKE ? OR generic_name LIKE ?
+                ORDER BY LENGTH(name) ASC
+                LIMIT 1
+                """,
+                (kw, kw),
+# (feat(diagnostics): show effective cfg; chroma list fallback; guideline collection autodetect)
             )
         else:
             return PersistentClient(path=persist_path, settings=settings)

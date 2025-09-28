@@ -30,7 +30,7 @@ from rag import retriever as R              # 供诊断面板使用（读取常�
 # =============================================================================
 # 0) 辅助函数 / Helpers
 # -----------------------------------------------------------------------------
-=======
+
 try:
     import pysqlite3  # noqa: F401
     import sys
@@ -72,7 +72,7 @@ with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
 # ---------------------------
 # 小工具
 # ---------------------------
->>>>>>> a6a9edc (在顶部（所有 chromadb/sqlite3 被导入之前）加入 sqlite shim)
+# (在顶部（所有 chromadb/sqlite3 被导入之前）加入 sqlite shim)
 def _env(key: str, default: str | None = None) -> str | None:
     """
     Secrets-aware env reader:
@@ -478,6 +478,7 @@ if res:
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
     with st.expander(title, expanded=False):
+
         # 有效配置（Secrets 优先）
         keys = ["CAREMIND_DEMO", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION",
                 "EMBEDDING_MODEL", "DRUG_DB_PATH"]
@@ -487,8 +488,21 @@ def render_diagnostics(lang: str = "zh") -> None:
         # ✅ 显示 retriever 版本号，确认云端是否更新到位
         st.write("Retriever version:", getattr(R, "VERSION", "unknown"))
 
+        # 有效配置（Secrets>Env>默认）——以 retriever 中解析后的“最终值”为准
+st.write(t(lang, "diag_cfg"))
+effective_cfg = {
+    "CAREMIND_DEMO": R.DEMO,
+    "CHROMA_PERSIST_DIR": R.CHROMA_PERSIST_DIR,
+    "CHROMA_COLLECTION": R.CHROMA_COLLECTION,
+    "EMBEDDING_MODEL": R.EMBED_MODEL,
+    "DRUG_DB_PATH": R.DRUG_DB_PATH,
+    "CHROMA_TELEMETRY_OFF": R.CHROMA_TELEMETRY_OFF,
+}
+st.code(json.dumps(effective_cfg, ensure_ascii=False, indent=2))
+#  (feat(diagnostics): show effective cfg; chroma list fallback; guideline collection autodetect)
+
         # Chroma 目录存在性
-        chroma_dir = eff.get("CHROMA_PERSIST_DIR") or "./chroma_store"
+        chroma_dir = effective_cfg.get("CHROMA_PERSIST_DIR") or "./chroma_store"
         abs_chroma = os.path.abspath(chroma_dir)
         st.write(f"{'Chroma 目录存在：' if lang=='zh' else 'Chroma dir exists:'} "
                  f"{abs_chroma} → {os.path.exists(abs_chroma)}")
