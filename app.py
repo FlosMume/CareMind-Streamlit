@@ -2,9 +2,6 @@
 """
 CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 ------------------------------------------------
-<<<<<<< HEAD
-（原始长版）CareMind Streamlit 前端
-=======
 特性 / Features
 >>>>>>> 31ae2fc (ui: restore full app UI; fix diagnostics via SQLite fallback; add retriever VERSION)
 - 双语 UI（中文 / English）
