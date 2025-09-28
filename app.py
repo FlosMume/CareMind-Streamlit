@@ -3,7 +3,6 @@
 CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 ------------------------------------------------
 特性 / Features
->>>>>>> 31ae2fc (ui: restore full app UI; fix diagnostics via SQLite fallback; add retriever VERSION)
 - 双语 UI（中文 / English）
 - 通过 rag.pipeline.answer 提供建议文本（反射式调用，兼容是否含 lang 参数）
 - 证据片段/药品结构化/运行日志 Tab
@@ -73,30 +72,60 @@ with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
 # ---------------------------
 # 小工具
 # ---------------------------
-# (在顶部（所有 chromadb/sqlite3 被导入之前）加入 sqlite shim)
+#(在顶部（所有 chromadb/sqlite3 被导入之前）加入 sqlite shim)
 def _env(key: str, default: str | None = None) -> str | None:
-    """优先 Secrets 再 env，最后默认。"""
+    """
+    Secrets-aware env reader:
+    优先 st.secrets[key]，其后 os.environ[key]，最后 default。
+    """
     try:
         return os.getenv(key, st.secrets.get(key, default))
     except Exception:
         return os.getenv(key, default)
 
-def _safe_int(x: Any, default: int = 4) -> int:
-    try:
-        v = int(x)
-        return v if v > 0 else default
-    except Exception:
-        return default
+def link_citations(md: str) -> str:
+    """
+    将 "[#3]" 或 "[3]" 转为页面锚点 "#hit-3"，便于从建议跳回证据片段。
+    """
+    return re.sub(r"\[(?:#)?(\d+)\]", r"[\1](#hit-\1)", md or "")
 
-def _count_chars(snippets: List[Dict[str, Any]]) -> int:
-    c = 0
-    for h in snippets or []:
-        c += len((h.get("content") or "").strip())
-    return c
+def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
+    """
+    将证据片段渲染为 Markdown（用于下载）。
+    """
+    lines = []
+    for i, h in enumerate(hits or [], 1):
+        m = h.get("meta") or {}
+        title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
+        source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
+        year   = str(m.get("year")   or "—")
+        head = f"### #{i} {title}\n\n" + (f"- 来源：{source} · 年份：{year}\n\n" if lang=="zh"
+                                          else f"- Source: {source} · Year: {year}\n\n")
+        lines.append(head + (h.get("content") or "") + "\n")
+    return "\n".join(lines)
+
+def friendly_hints(lang: str, exc: Exception) -> List[str]:
+    """把常见后端异常翻译成友好的排障提示。"""
+    msg = str(exc).lower()
+    zh = (lang == "zh")
+    tips = []
+    if "chromadb" in msg:
+        tips.append("· 检查 CHROMA_PERSIST_DIR / CHROMA_COLLECTION" if zh else
+                    "· Check CHROMA_PERSIST_DIR / CHROMA_COLLECTION")
+    if "sqlite" in msg:
+        tips.append("· 检查 SQLite 路径与表结构" if zh else
+                    "· Verify SQLite path & schema")
+    if "cuda" in msg or "cudnn" in msg:
+        tips.append("· 检查 CUDA/cuDNN 或切到 CPU" if zh else
+                    "· Check CUDA/cuDNN or switch to CPU")
+    if "module" in msg and "not found" in msg:
+        tips.append("· 确认 rag/__init__.py 与导入路径" if zh else
+                    "· Ensure rag/__init__.py and import path")
+    return tips
 
 
 # =============================================================================
-# 1) 文案 / i18n
+# 1) 极简 i18n（页面文案；pipeline 内部生成的文本已在后端本地化）
 # -----------------------------------------------------------------------------
 I18N: Dict[str, Dict[str, str]] = {
     "zh": {
@@ -125,7 +154,18 @@ I18N: Dict[str, Dict[str, str]] = {
         "advice_hdr": "建议（含引用与合规声明）",
         "time_used": "⏱️ 用时：{:.2f}s",
         "export_advice": "导出建议（Markdown）",
-        "export_hits": "导出证据（JSON）",
+        "export_evidence": "导出证据（Markdown）",
+        "disclaimer": "⚠️ 本工具仅供临床决策参考，不替代医师诊断与处方。",
+        "hits_hdr": "检索片段（Top-{k}，过滤后 {n} 条）",
+        "no_hits": "未检索到符合筛选条件的片段。",
+        "drug_hdr": "药品结构化信息（SQLite）",
+        "no_drug": "未提供或未检索到对应药品的结构化信息。",
+        "log_export": "导出本会话全部日志（JSON）",
+        "history_hdr": "🗂️ 本会话历史（点击复用）",
+        "no_history": "暂无历史记录。",
+        "reuse": "复用",
+        "reused_tip": "已复用：{q}（药品：{drug}，K={k}）。可编辑后再次生成。",
+        "page_footer": "© CareMind · MVP CDSS | 本工具仅供临床决策参考，不替代医师诊断与处方。",
         "chips_src": "来源：",
         "chips_year": "年份：",
         "chips_id": "ID：",
@@ -159,23 +199,34 @@ I18N: Dict[str, Dict[str, str]] = {
         "presets": "🧪 Question Presets",
         "preset_select": "Quick pick",
         "preset_none": "——",
-        "preset1": "CKD + HTN on ACEI/ARB monitoring",
-        "preset2": "Elderly with T2DM+CAD: BP target & plan",
-        "preset3": "GDM insulin initiation (indications & dose)",
-        "advice_hdr": "Advice (with citations & compliance)",
-        "time_used": "⏱️ Time used: {:+.2f}s",
+        "preset1": "Monitoring ACEI/ARB in CKD + Hypertension",
+        "preset2": "Elderly with T2DM+CAD: target BP and first-line therapy",
+        "preset3": "GDM: when to start insulin",
+        "advice_hdr": "Advice (with citations & compliance note)",
+        "time_used": "⏱️ Elapsed: {:.2f}s",
         "export_advice": "Export Advice (Markdown)",
-        "export_hits": "Export Evidence (JSON)",
+        "export_evidence": "Export Evidence (Markdown)",
+        "disclaimer": "⚠️ For clinical reference only. Not a substitute for diagnosis/prescription.",
+        "hits_hdr": "Retrieved segments (Top-{k}, {n} after filtering)",
+        "no_hits": "No snippets match the current filters.",
+        "drug_hdr": "Drug Structured Info (SQLite)",
+        "no_drug": "No structured drug info provided or found.",
+        "log_export": "Export session logs (JSON)",
+        "history_hdr": "🗂️ Session History (click to reuse)",
+        "no_history": "No history yet.",
+        "reuse": "Reuse",
+        "reused_tip": "Reused: {q} (Drug: {drug}, K={k}). Edit then generate again.",
+        "page_footer": "© CareMind · MVP CDSS | For clinical reference only.",
         "chips_src": "Source:",
         "chips_year": "Year:",
         "chips_id": "ID:",
         "stats_hits": "Snippets: {n} · Total chars: {c}",
         "warn_need_q": "Please enter a clinical question first.",
         "err_backend": "Backend error (see logs/diagnostics below).",
-        "diag_title": "Run Logs / Environment Diagnostics",
-        "diag_cfg": "Effective configuration (Secrets first)",
+        "diag_title": "Runtime Log / Diagnostics",
+        "diag_cfg": "Effective config (Secrets-first):",
         "diag_chroma": "Chroma collections:",
-        "diag_chroma_err": "Chroma error:",
+        "diag_chroma_err": "Chroma access error: ",
         "diag_sqlite": "SQLite tables:",
         "diag_sqlite_err": "SQLite error: ",
     },
@@ -190,14 +241,18 @@ def t(lang: str, key: str) -> str:
 st.set_page_config(page_title="CareMind · MVP CDSS", layout="wide", page_icon="💊")
 st.markdown("""
 <style>
-.cm-badge{display:inline-block;padding:2px 8px;border-radius:12px;background:#eef2ff;color:#3730a3;font-size:12px;border:1px solid #c7d2fe;margin-right:6px;white-space:nowrap;}
-.cm-chip{display:inline-block;padding:2px 8px;border-radius:8px;background:#f1f5f9;color:#0f172a;font-size:12px;border:1px solid #e2e8f0;margin-right:6px;margin-bottom:6px;}
+.cm-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;background:#eef2ff;border:1px solid #c7d2fe;margin-right:6px;white-space:nowrap;}
+.cm-chip{display:inline-block;padding:2px 8px;border-radius:8px;font-size:12px;background:#f1f5f9;border:1px solid #e2e8f0;margin:0 6px 6px 0;}
+.cm-muted{color:#64748b;font-size:13px;}
+.cm-output{line-height:1.75;font-size:17px;}
+.cm-card{border:1px solid #e5e7eb;background:#fff;border-radius:12px;padding:12px 14px;margin-bottom:10px;}
+footer{visibility:hidden;}
 </style>
 """, unsafe_allow_html=True)
 
 
 # =============================================================================
-# 3) 侧边栏设置
+# 3) 侧边栏
 # -----------------------------------------------------------------------------
 with st.sidebar:
     lang = st.selectbox("Language / 语言", options=["zh", "en"], index=0,
@@ -416,8 +471,9 @@ if res:
             use_container_width=True,
         )
 
+
 # =============================================================================
-# 8) 诊断面板（使用 retriever.list_collections_safe）
+# 8) 诊断面板（始终可见；使用 retriever.list_collections_safe）
 # -----------------------------------------------------------------------------
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
@@ -428,6 +484,7 @@ def render_diagnostics(lang: str = "zh") -> None:
         eff = {k: _env(k, None) for k in keys}
         st.write(t(lang, "diag_cfg"))
         st.code(json.dumps(eff, ensure_ascii=False, indent=2))
+        # ✅ 显示 retriever 版本号，确认云端是否更新到位
         st.write("Retriever version:", getattr(R, "VERSION", "unknown"))
 
         # Chroma 目录存在性
@@ -463,6 +520,7 @@ def render_diagnostics(lang: str = "zh") -> None:
 
 # 页面底部渲染诊断
 render_diagnostics(lang)
+
 
 # =============================================================================
 # 9) 页脚
