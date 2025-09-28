@@ -2,9 +2,13 @@
 """
 CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 ------------------------------------------------
+<<<<<<< HEAD
 （原始长版）CareMind Streamlit 前端
+=======
+特性 / Features
+>>>>>>> 31ae2fc (ui: restore full app UI; fix diagnostics via SQLite fallback; add retriever VERSION)
 - 双语 UI（中文 / English）
-- 通过 rag.pipeline.answer 提供建议（反射式，兼容是否含 lang 参数）
+- 通过 rag.pipeline.answer 提供建议文本（反射式调用，兼容是否含 lang 参数）
 - 证据片段/药品结构化/运行日志 Tab
 - ✅ 诊断面板：展示有效配置（Secrets 优先）、chroma_store 是否存在、
   Chroma 集合与条目数（调用 retriever.list_collections_safe 防止 `_type` 报错）、
@@ -415,9 +419,8 @@ if res:
             use_container_width=True,
         )
 
-
 # =============================================================================
-# 8) 诊断面板（始终可见；使用 retriever.list_collections_safe）
+# 8) 诊断面板（使用 retriever.list_collections_safe）
 # -----------------------------------------------------------------------------
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
@@ -444,17 +447,18 @@ def render_diagnostics(lang: str = "zh") -> None:
         except Exception as e:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
-        # SQLite 表
+        # SQLite 存在性与表
+        db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
+        abs_db = os.path.abspath(db_path)
+        st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
+                 f"{abs_db} → {os.path.exists(abs_db)}")
         try:
             import sqlite3
-            db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
-            tables = []
-            if os.path.exists(db_path):
-                con = sqlite3.connect(db_path)
-                cur = con.cursor()
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                tables = [r[0] for r in cur.fetchall()]
-                con.close()
+            con = sqlite3.connect(abs_db)
+            cur = con.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall()]
+            con.close()
             st.write(t(lang, "diag_sqlite"))
             st.json(tables)
         except Exception as e:
