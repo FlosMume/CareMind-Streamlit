@@ -16,6 +16,7 @@ __pycache__/
 venv/
 env/
 ENV/
+.env
 
 # 忽略本地数据库或缓存（但保留 chroma_store）
 db/
@@ -27,7 +28,20 @@ data/
 !data/guidelines.parsed.jsonl   # 如果需要保留小样本
 
 # 允许提交完整 Chroma 库（与 main 不同）
-!chroma_store/**
-
+chroma_store/**
+chroma_store*/
+chroma_store_clean/
+chroma_store_quarantined_*/
+chroma_store_sqlite_legacy/
 
 .streamlit/secrets.toml
+
+# Local tools / scratch
+tools/
+demo.py
+CompareRequirements.py
+fullRequirements.txt
+
+ingest/create_db.py
+rag/prompt_legacy.py
+rag/retriever4sqlite.py
