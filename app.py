@@ -22,10 +22,13 @@ import time
 import inspect
 from typing import Any, Dict, List, Optional
 import importlib
-import streamlit as st
-import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
-from rag import retriever as R              # 供诊断面板使用（读取常量 + 安全列集合）
 
+import streamlit as st
+# Import retriever first so it can install its SQLite shim if the stdlib is too old
+from rag import retriever as R  # noqa: F401    # 仅为 shim
+import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
+import sqlite3
+     
 
 # =============================================================================
 # 0) 辅助函数 / Helpers
@@ -41,8 +44,8 @@ except Exception:
 
 with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
     st.write("**Python version**:", sys.version)
-    st.write("**sqlite3 module version**:", sqlite3.version)
-    st.write("**sqlite3 library version**:", sqlite3.sqlite_version)
+    st.write("**sqlite3 module version**:", sqlite3.version)    # Python wrapper version
+    st.write("**sqlite3 library version**:", sqlite3.sqlite_version)    # Underlying lib version
 
     try:
         import torch
@@ -375,23 +378,28 @@ if res:
         st.markdown(f"<div class='cm-output'>{output_text}</div>", unsafe_allow_html=True)
         if elapsed is not None:
             st.caption(t(lang, "time_used").format(elapsed))
-        c1, c2 = st.columns(2)
-        with c1:
-            st.code(output_text, language="markdown")
-        with c2:
+        # 1) full-width preview
+        st.code(output_text, language="markdown")
+        # 2) compact downloads below, side-by-side
+        ev_md = evidence_md(lang, res.get("guideline_hits") or [])
+        b1, b2, _spacer = st.columns([1, 1, 4])
+        with b1:
             st.download_button(
-                t(lang, "export_advice"),
-                data=(output_text or "").encode("utf-8"),
-                file_name="caremind_advice.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
+            t(lang, "export_advice"),
+            data=(output_text or "").encode("utf-8"),
+            file_name="caremind_advice.md",
+            mime="text/markdown",
+            use_container_width=True,
+                disabled=not bool((output_text or "").strip()),
+        )
+        with b2:
             st.download_button(
-                t(lang, "export_evidence"),
-                data=evidence_md(lang, res.get("guideline_hits") or []).encode("utf-8"),
-                file_name="caremind_evidence.md",
-                mime="text/markdown",
-                use_container_width=True,
+            t(lang, "export_evidence"),
+            data=(ev_md or "").encode("utf-8"),
+            file_name="caremind_evidence.md",
+            mime="text/markdown",
+            use_container_width=True,
+            disabled=not bool((ev_md or "").strip()),
             )
         st.caption(t(lang, "disclaimer"))
 
