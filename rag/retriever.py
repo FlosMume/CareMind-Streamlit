@@ -1,581 +1,489 @@
 # -*- coding: utf-8 -*-
 """
-CareMind · RAG Retriever (Full, Rich-Commented)
-================================================
-版本: 2025-09-22-merged
+CareMind · RAG Retriever (richly commented, future-proof)
 
-本模块提供 CareMind 项目“检索侧”的所有能力与统一入口，包括：
-  1) ChromaDB 0.5.x 兼容的集合访问/查询（不依赖内部私有属性）
-  2) 查询端自编码 query_embeddings（与 ingest 模型一致，避免 0 命中）
-  3) 关键词直搜（where_document 只能配合 collection.get(...) 使用）
-  4) 双路检索策略：向量优先 → 关键词兜底，确保“证据不为空”
-  5) 可选 Cross-Encoder 重排（不可用时降级）
-  6) 本地 SQLite 药品库查询（结构化字段）
-  7) 健康检查/环境诊断（供前端日志面板使用）
-  8) 命令行 CLI（便于在服务器/WSL 直接验证）
+This consolidates the best parts of your previous retriever while fixing the
+partial-merge/indentation issues that broke `streamlit run`.
 
-重要提示
---------
-- 本文件**最顶部**含有 sqlite3 版本热修（HOTFIX），务必保留在最上方，确保在任何 chromadb 导入之前执行。
-- where_document 直搜**只能**用于 collection.get(...)，切勿塞入 collection.query(...)。
-- 如果你的 ingest 阶段使用的嵌入模型是 "BAAI/bge-large-zh-v1.5"，查询端也要一致；否则相似度会错位。
+Design goals
+------------
+1) Be **import-safe** in Streamlit Cloud and local dev:
+   - Provide a SQLite compatibility shim (uses stdlib if >=3.35.0, otherwise
+     aliases `pysqlite3` to `sqlite3`).
+   - Lazy-import Chroma so that missing/old system libs won’t crash the module
+     import (errors appear only when the functions are executed).
+2) Keep **one** Chroma client and **one** collection cache to avoid duplicate
+   stacks and race conditions across hot-reloads.
+3) Pre-migrate Chroma sysdb (`collections.configuration`) to insert a minimal
+   JSON with `_type` when missing — this unblocks older Chroma stores.
+4) Provide **stable public API** that `rag/pipeline.py` already calls:
+      - search_guidelines(question: str, k: int=4) -> List[dict]
+      - search_drug_structured(drug_name: str) -> Optional[dict]
+   …and keep extra helpers you will likely need soon:
+      - hybrid_search(query, k=8, use_sqlite=True) with RRF fusion
+      - _sqlite_search_drugfacts(name_substr, topn=5) -> List[dict]
+5) Rich logs to diagnose Cloud issues quickly.
+
+Environment variables
+---------------------
+CHROMA_PERSIST_DIR  : default "./chroma_store"
+CHROMA_COLLECTION   : default "guideline_chunks"
+EMBEDDING_MODEL     : default "BAAI/bge-large-zh-v1.5"
+DRUG_DB_PATH        : default "./db/drugs.sqlite"
+CHROMA_TELEMETRY_OFF: default "1" (turn off anonymized telemetry)
+
+CLI
+---
+$ python -m rag.retriever --q "哮喘 β受体阻滞剂" --topn 6
+$ python rag/retriever.py --q "aspirin" --method sqlite
 """
-
 from __future__ import annotations
 
-# ---------------------------------------------------------------------
-# HOTFIX: 强制使用“足够新的” sqlite3（Chroma 要求 sqlite3 >= 3.35.0）
-# 必须放在任何 chromadb 导入之前；否则 Chroma 先导入旧 sqlite3 就会报错。
-# ---------------------------------------------------------------------
-import sys as _sys
-try:
-    import sqlite3 as _sqlite3_check  # 初步尝试系统自带
-    from sqlite3 import sqlite_version as _sv
-    _maj, _min, _pat = (int(x) for x in (_sv.split(".") + ["0", "0"])[:3])
-    if (_maj, _min, _pat) < (3, 35, 0):
-        raise ImportError(f"sqlite3 too old: { _sv }")
-    # 若版本足够新，继续；否则进入 except 分支
-except Exception:
-    # 使用 manylinux 的 pysqlite3-binary 并别名为 sqlite3
-    import pysqlite3 as sqlite3  # type: ignore
-    _sys.modules["sqlite3"] = sqlite3
-else:
-    # 让后续代码都统一 from sqlite3 import ... 即可
-    import sqlite3  # noqa: E402
-
-# ---------------------------------------------------------------------
-# 常规标准库
-# ---------------------------------------------------------------------
 import os
-import re
+import sys
 import json
-import math
-import time
-import logging
-import argparse
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import contextlib
+from typing import Any, Dict, List, Optional, Tuple
 
-# ---------------------------------------------------------------------
-# 全局配置（从环境变量读取，可被上层覆盖）
-# ---------------------------------------------------------------------
-EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
-PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-COLLECTION  = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
-DRUG_DB     = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")
-RETRIEVER_VERSION = os.getenv("RETRIEVER_VERSION", "2025-09-22-merged")
+# =============================================================================
+# 0) Environment & logging
+# =============================================================================
 
-# ---------------------------------------------------------------------
-# 日志
-# ---------------------------------------------------------------------
-logger = logging.getLogger("caremind.retriever")
-if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    )
+# Disable Chroma telemetry by default (good for Cloud)
+os.environ.setdefault("CHROMA_TELEMETRY_ENABLED", "false")
+os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "false")
 
-# ---------------------------------------------------------------------
-# 懒加载单例（避免启动卡顿；Streamlit 每次热刷新也会重复 import）
-# ---------------------------------------------------------------------
-_CHROMA_CLIENT = None
-_CHROMA_COL    = None
-_EMBEDDER      = None
-_CROSS_ENCODER = None
+CHROMA_TELEMETRY_OFF = os.getenv("CHROMA_TELEMETRY_OFF", "1") not in ("0", "false", "False")
 
-# ---------------------------------------------------------------------
-# Chroma 客户端与集合（0.5.x 安全用法）
-# ---------------------------------------------------------------------
-def _get_client():
-    """
-    懒加载 Chroma 持久化客户端；不访问私有属性。
-    注意：确保在本文件顶部的 sqlite3 HOTFIX 之后再导入 chromadb
-    """
-    global _CHROMA_CLIENT
-    if _CHROMA_CLIENT is None:
-        try:
-            from chromadb import PersistentClient
-        except Exception as e:
-            # 把错误完整抛上去，便于前端展示
-            raise RuntimeError(f"Chroma import failed: {e}")
-        _CHROMA_CLIENT = PersistentClient(path=PERSIST_DIR)
-    return _CHROMA_CLIENT
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION",  "guideline_chunks")
+EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL",    "BAAI/bge-large-zh-v1.5")
+DRUG_DB_PATH       = os.getenv("DRUG_DB_PATH",       "./db/drugs.sqlite")
+
+VERSION = "retriever-2025-09-28"
+
+def _log(*msg: Any) -> None:
+    """Single place for retriever logs (helps when debugging Cloud deploys)."""
+    from datetime import datetime
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] retriever:", *msg, flush=True)
 
 
-def get_chroma_collection():
-    """
-    获取/创建集合：0.5.x 推荐 get_or_create_collection(name=...)
-    """
-    global _CHROMA_COL
-    if _CHROMA_COL is not None:
-        return _CHROMA_COL
-    client = _get_client()
-    _CHROMA_COL = client.get_or_create_collection(name=COLLECTION)
-    return _CHROMA_COL
+# =============================================================================
+# 1) SQLite compatibility shim (Cloud-friendly)
+# =============================================================================
+# Many managed environments ship an old libsqlite3 (<3.35.0) which breaks Chroma.
+# Strategy: try stdlib sqlite3; if version too old or missing, alias pysqlite3.
 
-
-def list_collections() -> List[Dict[str, Any]]:
-    """
-    列出集合（仅返回名称/错误），避免重 IO。
-    """
-    out: List[Dict[str, Any]] = []
+def _ensure_sqlite() -> None:
+    MIN = (3, 35, 0)
     try:
-        client = _get_client()
-        cols = client.list_collections()
-        for cinfo in cols:
-            name = getattr(cinfo, "name", None) or str(cinfo)
-            try:
-                _ = client.get_collection(name=name).get(limit=1)  # 触发 lazy init
-                out.append({"name": name})
-            except Exception as e:
-                out.append({"name": name, "error": str(e)})
+        import sqlite3 as _stdlib  # type: ignore
+        try:
+            ver_tuple = tuple(map(int, _stdlib.sqlite_version.split(".")))
+        except Exception:
+            ver_tuple = (0, 0, 0)
+        if ver_tuple >= MIN:
+            return
+        # Too old → prefer pysqlite3 (Wheel works on Cloud)
+        import pysqlite3 as _py  # type: ignore
+        sys.modules["sqlite3"] = _py
+    except Exception:
+        # stdlib missing or unusable → last resort
+        try:
+            import pysqlite3 as _py  # type: ignore
+            sys.modules["sqlite3"] = _py
+        except Exception as e:
+            raise RuntimeError(
+                "SQLite not available. Install `pysqlite3-binary>=0.5.3` or "
+                "use Python built with SQLite >= 3.35.0."
+            ) from e
+
+_ensure_sqlite()
+import sqlite3  # type: ignore  # noqa: E402
+
+
+# =============================================================================
+# 2) Lazy embedder (SentenceTransformers) and Chroma loader
+# =============================================================================
+# We avoid importing heavy libs at module import time.
+
+class _LazyEmbedder:
+    """Load the embedding model on the first call."""
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self._model = None
+
+    def __call__(self, texts: List[str]) -> List[List[float]]:
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            _log("Loading embedding model:", self.model_name)
+            self._model = SentenceTransformer(self.model_name)
+        texts = [t if isinstance(t, str) else str(t) for t in texts]
+        vecs = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        return vecs.tolist()
+
+class _ChromaEmbedFn:
+    """Adapter matching Chroma's embedding_function signature."""
+    def __init__(self, embedder: _LazyEmbedder):
+        self._embedder = embedder
+    def __call__(self, inputs: List[str]) -> List[List[float]]:
+        return self._embedder(inputs)
+
+_EMBED = _LazyEmbedder(EMBEDDING_MODEL)
+
+# Caches (survive Streamlit hot-reloads in many cases)
+_CLIENT = None
+_COLLECTION = None
+
+def _chroma_import():
+    """Import Chroma on demand."""
+    try:
+        from chromadb import PersistentClient, Settings  # type: ignore
+        return PersistentClient, Settings
     except Exception as e:
-        out.append({"error": f"list_collections failed: {e}"})
-    return out
+        raise RuntimeError(
+            "Failed to import `chromadb`. Install it and ensure SQLite is usable.\n"
+            "Tip: add `pysqlite3-binary` to requirements on Streamlit Cloud."
+        ) from e
 
 
-def peek_collection(n: int = 3) -> List[Dict[str, Any]]:
+# =============================================================================
+# 3) Chroma sysdb pre-migration (fix missing configuration._type)
+# =============================================================================
+
+def _sysdb_paths(persist_dir: str) -> List[str]:
+    """Return likely sysdb sqlite file paths inside `persist_dir`."""
+    import glob
+    pats = [
+        os.path.join(persist_dir, "chroma-*.db"),   # modern
+        os.path.join(persist_dir, "chroma.sqlite"), # older
+        os.path.join(persist_dir, "chroma.db"),     # very old
+    ]
+    files: List[str] = []
+    for p in pats:
+        files.extend(glob.glob(p))
+    return [f for f in files if os.path.isfile(f)]
+
+def _has_type(conf: Optional[str]) -> bool:
+    if not conf:
+        return False
+    try:
+        obj = json.loads(conf)
+        return isinstance(obj, dict) and "_type" in obj
+    except Exception:
+        return False
+
+def _premigrate_sysdb(persist_dir: str) -> int:
     """
-    安全“抽样”：通过 get(limit=..., include=...) 读取几条并返回简要信息。
-    彻底替代旧版 peek 对内部属性（如 max_seq_id）的访问。
+    Patch rows in `collections` where `configuration` is NULL/empty or lacks `_type`.
+    Returns how many rows were updated across all discovered sysdb files.
     """
+    paths = _sysdb_paths(persist_dir)
+    if not paths:
+        return 0
+    total = 0
+    for dbfile in paths:
+        try:
+            con = sqlite3.connect(dbfile)
+            cur = con.cursor()
+            cur.execute("SELECT id, configuration FROM collections")
+            rows = cur.fetchall()
+            fixed = 0
+            for cid, conf in rows:
+                if not _has_type(conf):
+                    payload = json.dumps({"_type":"CollectionConfigurationInternal"}, ensure_ascii=False)
+                    cur.execute("UPDATE collections SET configuration=? WHERE id=?", (payload, cid))
+                    fixed += 1
+            if fixed:
+                con.commit()
+                total += fixed
+                _log(f"[premigrate] {dbfile}: patched {fixed} row(s).")
+        except Exception as e:
+            _log(f"[premigrate] {dbfile}: error:", repr(e))
+        finally:
+            with contextlib.suppress(Exception):
+                con.close()
+    return tota
+
+
+# =============================================================================
+# 4) Client / collection getters (single, cached)
+# =============================================================================
+
+def get_chroma_client(persist_dir: Optional[str] = None):
+    """Create (once) and return a PersistentClient, after a best-effort premigrate."""
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+    pdir = (persist_dir or CHROMA_PERSIST_DIR)
+    os.makedirs(pdir, exist_ok=True)
+    # best-effort migration before touching Chroma
+    try:
+        changed = _premigrate_sysdb(pdir)
+        if changed:
+            _log(f"Premigrated collections: {changed}")
+    except Exception as e:
+        _log("Premigrate skipped due to error:", repr(e))
+    PersistentClient, Settings = _chroma_import()
+    _CLIENT = PersistentClient(
+        path=pdir,
+        settings=Settings(anonymized_telemetry=not CHROMA_TELEMETRY_OFF, allow_reset=True),
+    )
+    return _CLIENT
+
+def get_chroma_collection(name: Optional[str] = None, embed_model: Optional[str] = None):
+    """
+    Open (and cache) the primary collection.
+    Retry once after premigration if creation fails (covers broken stores).
+    """
+    global _COLLECTION
+    if _COLLECTION is not None:
+        return _COLLECTION
+    client = get_chroma_client()
+    embed_fn = _ChromaEmbedFn(_EMBED if not embed_model else _LazyEmbedder(embed_model))
+    target = (name or CHROMA_COLLECTION)
+    try:
+        _COLLECTION = client.get_or_create_collection(name=target, embedding_function=embed_fn)
+        return _COLLECTION
+    except Exception as e:
+        _log("get_or_create_collection failed:", repr(e))
+        _log("Retry after premigration …")
+        try:
+            _premigrate_sysdb(CHROMA_PERSIST_DIR)
+        except Exception as e2:
+            _log("Premigrate during retry failed:", repr(e2))
+        # retry once
+        _COLLECTION = client.get_or_create_collection(name=target, embedding_function=embed_fn)
+        _log("Collection opened after migrate+retry.")
+        return _COLLECTION
+
+
+# =============================================================================
+# 5) Public API — Guideline vector search
+# =============================================================================
+
+def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
+    """
+    Retrieve Top-k guideline chunks via Chroma.
+    Returns a list of dicts:
+        { 'id': str, 'content': str, 'meta': dict, 'score': float }
+    where `score` is (1 - distance) so that **higher is better**.
+    Safe: returns [] if query is empty or Chroma is unavailable.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
     try:
         col = get_chroma_collection()
-        rec = col.get(limit=n, include=["ids", "documents", "metadatas"])
-        ids   = rec.get("ids") or []
-        docs  = rec.get("documents") or []
-        metas = rec.get("metadatas") or []
+        res = col.query(
+            query_texts=[q],
+            n_results=max(1, int(k)),
+            include=["documents", "metadatas", "distances", "ids"],
+        )
+        ids   = (res.get("ids") or [[]])[0]
+        docs  = (res.get("documents") or [[]])[0]
+        metas = (res.get("metadatas") or [[]])[0]
+        dists = (res.get("distances") or [[]])[0]
         out: List[Dict[str, Any]] = []
-        for i in range(min(n, len(ids))):
-            m = metas[i] or {}
-            d = (docs[i] or "").replace("\n", " ")
+        for i, _id in enumerate(ids):
+            content = docs[i] if i < len(docs) else ""
+            meta    = metas[i] if i < len(metas) else {}
+            dist    = float(dists[i] if i < len(dists) else 0.0)
             out.append({
-                "id": ids[i],
-                "title": m.get("title"),
-                "year": m.get("year"),
-                "source": m.get("source"),
-                "preview": d[:240] + ("…" if len(d) > 240 else "")
+                "id": _id,
+                "content": content,
+                "meta": meta,
+                "score": 1.0 - dist,
             })
         return out
     except Exception as e:
-        return [{"error": f"peek failed: {e}"}]
-
-# ---------------------------------------------------------------------
-# 嵌入与编码（与 ingest 模型保持一致）
-# ---------------------------------------------------------------------
-def _get_embedder():
-    """
-    统一查询端编码器；与 ingest 模型一致，避免相似度错位。
-    """
-    global _EMBEDDER
-    if _EMBEDDER is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except Exception as e:
-            raise RuntimeError(f"sentence-transformers unavailable: {e}")
-        _EMBEDDER = SentenceTransformer(EMBED_MODEL)
-    return _EMBEDDER
-
-
-def encode_query(texts: List[str]) -> List[List[float]]:
-    """
-    将查询文本编码为向量（normalize_embeddings=True 利于 cosine）。
-    """
-    model = _get_embedder()
-    vecs = model.encode(texts, normalize_embeddings=True)
-    return [v.tolist() if hasattr(v, "tolist") else list(v) for v in vecs]
-
-# ---------------------------------------------------------------------
-# 关键词直搜（不走向量）：collection.get(where_document=...)
-# ---------------------------------------------------------------------
-def keyword_get(where_text: str, limit: int = 8) -> List[Dict[str, Any]]:
-    """
-    关键词直搜（不走向量）：
-      - 0.5.x 的 where_document 只能搭配 collection.get(...)
-      - 模糊匹配：{"$contains": "..."}
-    """
-    col = get_chroma_collection()
-    try:
-        rec = col.get(
-            where_document={"$contains": where_text},
-            include=["ids", "documents", "metadatas"],
-            limit=limit
-        )
-        hits: List[Dict[str, Any]] = []
-        ids   = rec.get("ids") or []
-        docs  = rec.get("documents") or []
-        metas = rec.get("metadatas") or []
-        for i, _id in enumerate(ids):
-            md = metas[i] or {}
-            dc = docs[i] or ""
-            hits.append({
-                "id": _id,
-                "doc": dc,
-                "meta": md,
-                "score": None,       # 直搜无距离分数
-                "channel": "keyword"
-            })
-        return hits
-    except Exception as e:
-        return [{"error": f"where_document get failed: {e}"}]
-
-# ---------------------------------------------------------------------
-# 主检索：向量优先 + 关键词兜底（确保结果不空）
-# ---------------------------------------------------------------------
-def search_guidelines(question: str, k: int = 8) -> List[Dict[str, Any]]:
-    """
-    先做向量检索；若失败或 0 命中，则用关键词直搜兜底。
-    返回结构：[ {score, doc, meta, channel} ... ]
-      - 向量检索：channel="vector"，score=距离（越小越相似）
-      - 关键词直搜：channel="keyword"，score=None
-    """
-    col = get_chroma_collection()
-    q = (question or "").strip()
-    if not q:
+        _log("search_guidelines error:", repr(e))
         return []
 
-    # 1) 向量检索
-    try:
-        embeds = encode_query([q])
-        res = col.query(
-            query_embeddings=embeds,
-            n_results=max(1, k),
-            include=["documents", "metadatas", "distances"],
-        )
-        docs  = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        dists = res.get("distances", [[]])[0]
-        hits: List[Dict[str, Any]] = []
-        for i, d in enumerate(docs):
-            hits.append({
-                "score": float(dists[i]) if i < len(dists) else None,
-                "doc": d,
-                "meta": metas[i] if i < len(metas) else {},
-                "channel": "vector"
-            })
-        if hits:
-            return hits
-    except Exception as e:
-        logger.warning(f"vector query failed: {e}")
 
-    # 2) 关键词兜底：简单切词（中英混合）
-    terms = [t for t in re.split(r"[^\w\u4e00-\u9fff]+", q) if len(t) >= 2]
-    seen = set()
-    merged: List[Dict[str, Any]] = []
-    for t in terms[:6]:
-        ks = keyword_get(t, limit=max(2, k // 2))
-        for h in ks:
-            _id = h.get("id")
-            if not _id or _id in seen:
-                continue
-            seen.add(_id)
-            merged.append(h)
-            if len(merged) >= k:
-                break
-        if len(merged) >= k:
-            break
-    return merged
+# =============================================================================
+# 6) Public API — Structured drug lookup (SQLite)
+# =============================================================================
 
-
-def ensure_non_empty_evidence(question: str, k: int = 6) -> List[Dict[str, Any]]:
-    """
-    UI 兜底：即便检索失败，也返回“提示占位”，避免前端显示空白。
-    """
-    hits = search_guidelines(question, k=k) or []
-    if hits:
-        return hits
-    return [{
-        "score": None,
-        "doc": "（未命中向量与直搜。建议：缩短问题、加入关键实体词；或检查集合名与嵌入模型是否一致。）",
-        "meta": {"title": "系统提示", "source": "CareMind Retriever"},
-        "channel": "hint"
-    }]
-
-# ---------------------------------------------------------------------
-# 轻量重排（可选 Cross-Encoder；不可用时降级）
-# ---------------------------------------------------------------------
-def _get_cross_encoder():
-    """
-    返回 Cross-Encoder 实例；不可用时返回 None（上层降级）。
-    优先尝试独立包 cross-encoder，然后尝试 sentence-transformers 内置 CrossEncoder。
-    """
-    global _CROSS_ENCODER
-    if _CROSS_ENCODER is not None:
-        return _CROSS_ENCODER
-    model_name = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-    try:
-        from cross_encoder import CrossEncoder  # 独立包
-        _CROSS_ENCODER = CrossEncoder(model_name)
-        return _CROSS_ENCODER
-    except Exception:
-        try:
-            from sentence_transformers import CrossEncoder  # ST 内置
-            _CROSS_ENCODER = CrossEncoder(model_name)
-            return _CROSS_ENCODER
-        except Exception as e:
-            logger.info(f"Cross-Encoder unavailable, fallback to base ranking: {e}")
-            return None
-
-
-def rrf_merge(rank_lists: List[List[Dict[str, Any]]], k: int = 8, k_rrf: float = 60.0) -> List[Dict[str, Any]]:
-    """
-    Reciprocal Rank Fusion（RRR）：对若干个排序列表做 1/(k_rrf + rank) 融合。
-    用于多通道融合（如向量 + 关键词）。
-    """
-    score_map: Dict[str, float] = {}
-    store_map: Dict[str, Dict[str, Any]] = {}
-
-    for results in rank_lists:
-        for rnk, item in enumerate(results, start=1):
-            _id = item.get("id") or f"NOID::{(item.get('doc') or '')[:40]}"
-            score_map[_id] = score_map.get(_id, 0.0) + 1.0 / (k_rrf + rnk)
-            if _id not in store_map:
-                store_map[_id] = item
-
-    fused = [{**store_map[_id], "rrf": sc} for _id, sc in score_map.items()]
-    fused.sort(key=lambda x: x.get("rrf", 0.0), reverse=True)
-    return fused[:k]
-
-
-def rerank(question: str, hits: List[Dict[str, Any]], k: int = 8) -> List[Dict[str, Any]]:
-    """
-    若可用 CE，则用 CE 对 topN 重排；否则返回截断。
-    """
-    if not hits:
-        return hits
-    ce = _get_cross_encoder()
-    if ce is None:
-        return hits[:k]
-    try:
-        pairs = [(question, h.get("doc", "")) for h in hits[: max(24, k * 2)]]
-        scores = ce.predict(pairs)  # 越高越好
-        aug = []
-        for h, s in zip(hits, scores):
-            hh = dict(h)
-            hh["ce_score"] = float(s)
-            aug.append(hh)
-        aug.sort(key=lambda x: x.get("ce_score", 0.0), reverse=True)
-        return aug[:k]
-    except Exception as e:
-        logger.info(f"Cross-Encoder predict failed, fallback: {e}")
-        return hits[:k]
-
-# ---------------------------------------------------------------------
-# 药品结构化查询（SQLite）
-# ---------------------------------------------------------------------
-def _open_drug_db(path: str = DRUG_DB) -> Optional[sqlite3.Connection]:
-    """
-    打开本地药品数据库；若不存在则返回 None。
-    """
-    if not path or not os.path.isfile(path):
-        logger.warning(f"SQLite not found: {path}")
+def _connect_sqlite(path: str) -> Optional[sqlite3.Connection]:
+    if not path or not os.path.exists(path):
         return None
     try:
-        conn = sqlite3.connect(path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        con = sqlite3.connect(path)
+        con.row_factory = sqlite3.Row
+        return con
     except Exception as e:
-        logger.error(f"open sqlite failed: {e}")
+        _log("sqlite connect failed:", repr(e))
         return None
 
-
-def lookup_drug(name: str, limit: int = 5) -> List[Dict[str, Any]]:
+def _sqlite_search_drugfacts(name_substr: str, topn: int = 5) -> List[Dict[str, Any]]:
     """
-    在表 `drugs` 中按名称/别名模糊检索，返回结构化字段。
-    你可根据实际库结构调整 SELECT 列。
+    Return lightweight text snippets from a simple `drugs` table. You can adapt
+    the SQL/columns to your actual schema later.
     """
-    conn = _open_drug_db()
-    if conn is None:
+    key = (name_substr or "").strip()
+    if not key:
         return []
-    q = (name or "").strip()
-    if not q:
+    con = _connect_sqlite(DRUG_DB_PATH)
+    if con is None:
         return []
     try:
-        sql = """
-        SELECT name, aliases, indication, contraindication, interactions, pregnancy, source
-        FROM drugs
-        WHERE name LIKE ? OR (aliases IS NOT NULL AND aliases LIKE ?)
-        LIMIT ?
-        """
-        like = f"%{q}%"
-        cur = conn.cursor()
-        cur.execute(sql, (like, like, limit))
+        cur = con.cursor()
+        # Adjust the table/columns below to match your schema
+        cur.execute(
+            "SELECT name, indications, contraindications, interactions, pregnancy, source "
+            "FROM drugs WHERE name LIKE ? ORDER BY name LIMIT ?",
+            (f"%{key}%", int(topn)),
+        )
         rows = cur.fetchall()
         out: List[Dict[str, Any]] = []
         for r in rows:
+            name, indications, contraindications, interactions, pregnancy, source = r
+            text = "\n".join([
+                str(name or ""),
+                f"适应症: {indications or ''}",
+                f"禁忌: {contraindications or ''}",
+                f"相互作用: {interactions or ''}",
+                f"妊娠分级: {pregnancy or ''}",
+            ]).strip()
             out.append({
-                "name": r["name"],
-                "aliases": r["aliases"],
-                "indication": r["indication"],
-                "contraindication": r["contraindication"],
-                "interactions": r["interactions"],
-                "pregnancy": r["pregnancy"],
-                "source": r["source"],
+                "id": f"sqlite:{name}",
+                "content": text,
+                "meta": {"title": name, "source": source or "sqlite", "type": "drug"},
+                "score": 0.50,  # neutral-ish; will be fused by RRF if needed
+            })
+        return out
+    finally:
+        with contextlib.suppress(Exception):
+            con.close()
+
+def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Very small helper used by pipeline.py.
+    Returns a single best-effort dict:
+        { 'name': str, 'row': dict }  OR  None
+    If your schema is different, update `_sqlite_search_drugfacts` accordingly.
+    """
+    key = (drug_name or "").strip()
+    if not key:
+        return None
+    con = _connect_sqlite(DRUG_DB_PATH)
+    if con is None:
+        return None
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{key}%",))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"name": row["name"] if "name" in row.keys() else key, "row": dict(row)}
+    finally:
+        with contextlib.suppress(Exception):
+            con.close()
+
+
+# =============================================================================
+# 7) Hybrid search (RRF fusion) — optional, for future use
+# =============================================================================
+
+def _rrf(lists: List[List[Dict[str, Any]]], k: int, k_rrf: float = 60.0) -> List[Dict[str, Any]]:
+    """
+    Reciprocal Rank Fusion across multiple result lists.
+    Each item must have a stable id (we synthesize one if missing).
+    """
+    from collections import defaultdict
+    bucket: Dict[str, Dict[str, Any]] = {}
+    score = defaultdict(float)
+    for lst in lists:
+        for rank, item in enumerate(lst):
+            _id = str(item.get("id") or f"@{id(item)}")
+            bucket[_id] = item
+            score[_id] += 1.0 / (k_rrf + rank + 1)
+    ranked = sorted(bucket.items(), key=lambda kv: score[kv[0]], reverse=True)
+    out: List[Dict[str, Any]] = []
+    for _id, it in ranked[:max(1, int(k))]:
+        it = dict(it)
+        it["rrf"] = score[_id]
+        out.append(it)
+    return out
+
+def hybrid_search(query: str, k: int = 8, use_sqlite: bool = True) -> List[Dict[str, Any]]:
+    """
+    Combine vector guidelines and (optional) SQLite drugfacts via RRF.
+    Handy for quick demos; not used by pipeline.py today.
+    """
+    base = search_guidelines(query, k=k)
+    lists = [base]
+    if use_sqlite:
+        lists.append(_sqlite_search_drugfacts(query, topn=k))
+    return _rrf(lists, k=k)
+
+
+# =============================================================================
+# 8) CLI smoke test
+# =============================================================================
+
+def _pretty(hits: List[Dict[str, Any]]) -> None:
+    for i, h in enumerate(hits, 1):
+        m = h.get("meta") or {}
+        title = m.get("title") or m.get("section") or ""
+        src   = m.get("source") or ""
+        typ   = m.get("type") or ""
+        line1 = (h.get("content") or "").strip().replace("\n", " ")
+        print(f"{i:>2}. score={h.get('score',0):.3f} rrf={h.get('rrf',0):.4f} | {title} [{typ}] | {src}")
+        if line1:
+            print("    ", (line1[:160] + "…") if len(line1) > 160 else line1)
+
+# ---- Diagnostics helpers (called from app.py) ----
+from typing import Any, Dict, List
+
+def list_collections_safe(max_items: int = 100) -> List[Dict[str, Any]]:
+    """
+    List Chroma collections with basic stats, but never raise on error.
+    Each item: {"name": str, "id": str, "count": int, "metadata": dict}
+    """
+    try:
+        client = get_chroma_client()
+        cols = client.list_collections()
+        out: List[Dict[str, Any]] = []
+        for c in cols[:max_items]:
+            try:
+                cnt = int(c.count())
+            except Exception:
+                cnt = -1
+            out.append({
+                "name": getattr(c, "name", ""),
+                "id": getattr(c, "id", ""),
+                "count": cnt,
+                "metadata": getattr(c, "metadata", {}) or {},
             })
         return out
     except Exception as e:
-        logger.error(f"lookup_drug failed: {e}")
+        _log("list_collections_safe error:", repr(e))
         return []
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-# ---------------------------------------------------------------------
-# 健康检查 / 环境诊断
-# ---------------------------------------------------------------------
-def print_health() -> Dict[str, Any]:
-    """
-    返回可 JSON 化的运行时信息，供前端日志面板展示。
-    """
-    info: Dict[str, Any] = {
-        "env": {
-            "CAREMIND_DEMO": os.getenv("CAREMIND_DEMO", "0"),
-            "CHROMA_PERSIST_DIR": PERSIST_DIR,
-            "CHROMA_COLLECTION": COLLECTION,
-            "EMBEDDING_MODEL": EMBED_MODEL,
-            "DRUG_DB_PATH": DRUG_DB,
-            "RETRIEVER_VERSION": RETRIEVER_VERSION,
-        },
-        "sqlite": {
-            "runtime_sqlite_version": getattr(sqlite3, "sqlite_version", "unknown"),
-            "path": os.path.abspath(DRUG_DB),
-            "exists": os.path.isfile(DRUG_DB),
-        },
-        "chroma": {
-            "dir": os.path.abspath(PERSIST_DIR),
-            "dir_exists": os.path.isdir(PERSIST_DIR),
-            "collections": [],
-            "peek": [],
-        }
-    }
-
-    # 列集合
-    try:
-        info["chroma"]["collections"] = list_collections()
-    except Exception as e:
-        info["chroma"]["collections"] = [{"error": str(e)}]
-
-    # 快速抽样
-    try:
-        info["chroma"]["peek"] = peek_collection(3)
-    except Exception as e:
-        info["chroma"]["peek"] = [{"error": str(e)}]
-
-    # SQLite 表列表
-    if info["sqlite"]["exists"]:
-        try:
-            conn = sqlite3.connect(DRUG_DB)
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            info["sqlite"]["tables"] = [r[0] for r in cur.fetchall()]
-            conn.close()
-        except Exception as e:
-            info["sqlite"]["error"] = str(e)
-
-    return info
-
-# ---------------------------------------------------------------------
-# 统一检索入口（供 pipeline/app 调用）
-# ---------------------------------------------------------------------
-@dataclass
-class RetrieveOptions:
-    topn: int = 8              # 返回条数
-    method: str = "rrf"        # "rrf" / "none" / "ce"
-
-
-def retrieve(question: str, opts: RetrieveOptions = RetrieveOptions()) -> Dict[str, Any]:
-    """
-    统一入口：
-      - 先基础命中（向量 + 关键词兜底）
-      - 再按 method 做重排（ce / rrf / none）
-      - 永不返回空 evidence（最差一条“提示占位”）
-    """
-    t0 = time.time()
-    base_hits = ensure_non_empty_evidence(question, k=max(2, opts.topn * 2))
-
-    if opts.method == "ce":
-        final_hits = rerank(question, base_hits, k=opts.topn)
-    elif opts.method == "rrf":
-        # 若你保留两路原始列表，可在此处做真正的 RRF；这里简化为截断（base_hits 已混合）
-        final_hits = base_hits[:opts.topn]
-    else:
-        final_hits = base_hits[:opts.topn]
-
-    return {
-        "question": question,
-        "hits": final_hits,
-        "t_sec": round(time.time() - t0, 3),
-        "meta": {
-            "method": opts.method,
-            "topn": opts.topn,
-            "embedding_model": EMBED_MODEL,
-            "collection": COLLECTION,
-            "retriever_version": RETRIEVER_VERSION
-        }
-    }
-
-# ---------------------------------------------------------------------
-# CLI 调试入口
-#   例：
-#     python rag/retriever.py --health
-#     python rag/retriever.py --peek
-#     python rag/retriever.py --kw 哮喘 --topn 5
-#     python rag/retriever.py --q "老年 高血压 糖尿病 目标" --topn 8 --method rrf
-# ---------------------------------------------------------------------
-def _fmt_hit(h: Dict[str, Any], idx: int) -> str:
-    m = h.get("meta") or {}
-    head = f"[{idx}] {m.get('title') or 'Untitled'} | {m.get('source') or '-'} | {m.get('year') or '-'}"
-    ch = h.get("channel") or "-"
-    # 分数字段优先级：ce_score > rrf > score
-    score_fields = [k for k in ("ce_score", "rrf", "score") if h.get(k) is not None]
-    score_str = ", ".join([f"{k}={h.get(k):.4f}" if isinstance(h.get(k),(int,float)) else f"{k}={h.get(k)}" for k in score_fields])
-    body = (h.get("doc") or "").strip().replace("\n", " ")
-    body = re.sub(r"\s+", " ", body)[:300]
-    return f"{head}  [{ch}]  ({score_str})\n    {body}"
-
 
 def main():
-    ap = argparse.ArgumentParser(description="CareMind Retriever · CLI")
-    ap.add_argument("--q", "--query", dest="query", type=str, default="老年 高血压 糖尿病 目标", help="查询")
-    ap.add_argument("--topn", type=int, default=8, help="返回条数")
-    ap.add_argument("--method", type=str, default="rrf", choices=["rrf", "none", "ce"], help="重排方法")
-    ap.add_argument("--peek", action="store_true", help="仅抽样集合内容")
-    ap.add_argument("--kw", type=str, default="", help="仅关键词直搜（不走向量）")
-    ap.add_argument("--health", action="store_true", help="打印健康检查 JSON")
+    import argparse
+    ap = argparse.ArgumentParser(description="CareMind RAG Retriever")
+    ap.add_argument("--q", "--query", dest="query", type=str, required=True)
+    ap.add_argument("--topn", type=int, default=8)
+    ap.add_argument("--method", type=str, default="guideline", choices=["guideline", "sqlite", "rrf"])
+    ap.add_argument("--no-sqlite", action="store_true")
     args = ap.parse_args()
 
-    if args.health:
-        print(json.dumps(print_health(), ensure_ascii=False, indent=2))
-        return
+    _log("Version:", VERSION)
+    _log("Embedding model:", EMBEDDING_MODEL)
+    _log("Chroma dir:", CHROMA_PERSIST_DIR, "| collection:", CHROMA_COLLECTION)
+    _log("SQLite path:", DRUG_DB_PATH)
 
-    if args.peek:
-        sample = peek_collection(3)
-        print("PEEK:")
-        for i, it in enumerate(sample, 1):
-            print(f"  {i}. {json.dumps(it, ensure_ascii=False)[:400]}")
-        return
-
-    if args.kw:
-        ks = keyword_get(args.kw, limit=args.topn)
-        print(f"KW GET [{args.kw}] -> {len(ks)} hit(s)")
-        for i, h in enumerate(ks, 1):
-            print(_fmt_hit(h, i))
-        return
-
-    # 常规：统一检索入口
-    out = retrieve(args.query, RetrieveOptions(topn=args.topn, method=args.method))
-    print(f"Question:  {out['question']}")
-    print(f"Method:    {out['meta']['method']} | TopN={out['meta']['topn']}")
-    print(f"Embed:     {out['meta']['embedding_model']}")
-    print(f"Collection:{out['meta']['collection']}")
-    print(f"Version:   {out['meta']['retriever_version']}")
-    print(f"Time:      {out['t_sec']}s")
-    print("-"*80)
-    for i, h in enumerate(out["hits"], 1):
-        print(_fmt_hit(h, i))
-
+    if args.method == "guideline":
+        hits = search_guidelines(args.query, k=args.topn)
+    elif args.method == "sqlite":
+        hits = _sqlite_search_drugfacts(args.query, topn=args.topn)
+    else:
+        hits = hybrid_search(args.query, k=args.topn, use_sqlite=not args.no_sqlite)
+    _pretty(hits or [])
 
 if __name__ == "__main__":
     main()

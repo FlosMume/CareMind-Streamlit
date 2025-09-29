@@ -1,390 +1,536 @@
 # -*- coding: utf-8 -*-
 """
-CareMind · 临床决策支持（MVP）
-长版 app.py（已合并补丁 · 2025-09-22）
-
-本文件的目标：
-1) 维持你原有的 UI 区块布局（问题输入 / 建议 / 证据 / 药品结构化 / 运行日志）
-2) 与新版 rag/retriever.py 的 API 对齐（0.5.x 兼容）：
-   - list_collections_safe → list_collections()
-   - 旧 peek（访问 max_seq_id） → peek_collection(n)
-   - where_document 直搜 → 使用 retriever.keyword_get()（内部用 collection.get(..., where_document=...)）
-3) 让“导出”按钮更紧凑 + 防空内容导出
-4) 提供中英双语切换（简易），便于现场演示
-
-如需对接你更早的长版 UI，只要将核心调用替换为本文对应函数即可。
+CareMind · MVP CDSS (Streamlit, bilingual zh/en)
+------------------------------------------------
+特性 / Features
+- 双语 UI（中文 / English）
+- 通过 rag.pipeline.answer 提供建议文本（反射式调用，兼容是否含 lang 参数）
+- 证据片段/药品结构化/运行日志 Tab
+- ✅ 诊断面板：展示有效配置（Secrets 优先）、chroma_store 是否存在、
+  Chroma 集合与条目数（调用 retriever.list_collections_safe 防止 `_type` 报错）、
+  SQLite 文件是否存在与表清单
+- ✅ 新增：本会话历史记录与“一键复用”
+- 不显示 Python 版本信息
 """
 
 from __future__ import annotations
 
 import os
-import io
 import re
 import json
 import time
-import textwrap
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+import inspect
+from typing import Any, Dict, List, Optional
+import importlib
 
 import streamlit as st
+# Import retriever first so it can install its SQLite shim if the stdlib is too old
+from rag import retriever as R  # noqa: F401    # 仅为 shim
+import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
+import sqlite3
+     
 
-# ---------------------------------------------------------------------
-# 环境兜底（云端常见问题）：若安装了 pysqlite3-binary，则别名为 sqlite3
-# （有些托管环境缺系统级 sqlite3，改用 manylinux 轮子）
-# ---------------------------------------------------------------------
+# =============================================================================
+# 0) 辅助函数 / Helpers
+# -----------------------------------------------------------------------------
+
 try:
-    import sqlite3  # noqa: F401
+    import pysqlite3  # noqa: F401
+    import sys
+    sys.modules["sqlite3"] = __import__("pysqlite3")
 except Exception:
+    pass
+
+
+with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
+    st.write("**Python version**:", sys.version)
+    st.write("**sqlite3 module version**:", sqlite3.version)    # Python wrapper version
+    st.write("**sqlite3 library version**:", sqlite3.sqlite_version)    # Underlying lib version
+
     try:
-        import pysqlite3 as sqlite3  # type: ignore
-        import sys as _sys
-        _sys.modules["sqlite3"] = sqlite3
+        import torch
+        st.write("**Torch version**:", torch.__version__)
     except Exception as e:
-        # 不在此处硬失败；retriever 的健康检查会给出更明确的错误
-        st.warning(f"⚠️ SQLite 初始化警告：{e}")
+        st.error(f"Torch not available: {e}")
 
-# ---------------------------------------------------------------------
-# 项目内模块
-# ---------------------------------------------------------------------
-from rag import retriever as R  # 新版 retriever：含 list_collections/peek_collection/keyword_get/print_health/retrieve 等
+    try:
+        chromadb = importlib.import_module("chromadb")
+        st.write("**Chroma version**:", chromadb.__version__)
+    except Exception as e:
+        st.error(f"Chroma import failed: {e}")
 
-# ---------------------------------------------------------------------
-# 页面设置与全局样式
-# ---------------------------------------------------------------------
-st.set_page_config(
-    page_title="CareMind · 临床决策支持（MVP）",
-    page_icon="🩺",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+    persist = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+    coll = os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2")
+    st.write("**CHROMA_PERSIST_DIR**:", persist)
+    st.write("**CHROMA_COLLECTION (from env)**:", coll)
 
-# 轻量 CSS：压缩按钮与卡片留白；避免导出按钮过于占位
-st.markdown(
+    try:
+        client = chromadb.PersistentClient(path=persist)
+        col = client.get_collection(coll)
+        st.write("**Collection count**:", col.count())
+    except Exception as e:
+        st.error(f"❌ Failed to open collection: {e}")
+
+
+# ---------------------------
+# 小工具
+# ---------------------------
+#(在顶部（所有 chromadb/sqlite3 被导入之前）加入 sqlite shim)
+def _env(key: str, default: str | None = None) -> str | None:
     """
-    <style>
-      .small-btn button {padding: 0.35rem 0.6rem; font-size: 0.85rem;}
-      .tight-block {margin-top: 0.25rem; margin-bottom: 0.25rem;}
-      .code-wrap pre {white-space: pre-wrap;}
-      .muted {opacity: 0.7;}
-      .mono {font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;}
-      .warn-box {background:#fff7ed;border:1px solid #fed7aa;padding:0.75rem;border-radius:0.5rem;}
-      .ok-box {background:#f0fdf4;border:1px solid #bbf7d0;padding:0.75rem;border-radius:0.5rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------------------------------------------------------------
-# 简单的中英双语开关（不改核心逻辑，只改标签）
-# ---------------------------------------------------------------------
-LANG = st.sidebar.selectbox("界面语言 / Language", ["中文", "English"], index=0)
-
-def T(cn: str, en: str) -> str:
-    return cn if LANG == "中文" else en
-
-# ---------------------------------------------------------------------
-# 环境变量读入（用于展示 + 便于在云端核对）
-# ---------------------------------------------------------------------
-DEMO_MODE = os.getenv("CAREMIND_DEMO", "0")
-CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-CHROMA_COL = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
-EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
-DRUG_DB = os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite")
-RETRIEVER_VERSION = os.getenv("RETRIEVER_VERSION", "2025-09-22-merged")
-
-# ---------------------------------------------------------------------
-# 页面顶部：标题与说明
-# ---------------------------------------------------------------------
-st.title("CareMind · 临床决策支持（MVP）")
-
-st.caption(
-    T(
-        "⚠️ 本工具仅供临床决策参考，不替代医师诊断与处方。",
-        "⚠️ This tool is for clinical decision support only; it does not replace professional diagnosis or prescription."
-    )
-)
-
-# ---------------------------------------------------------------------
-# 输入区：临床问题 + 可选药品名 + 检索参数
-# ---------------------------------------------------------------------
-with st.container():
-    col_q1, col_q2 = st.columns([3, 1.2], gap="large")
-    with col_q1:
-        q = st.text_area(
-            T("输入临床问题", "Enter a clinical question"),
-            height=96,
-            placeholder=T("例如：合并支气管哮喘的高血压患者是否可用β受体阻滞剂？", "e.g., Can beta-blockers be used in hypertensive patients with bronchial asthma?"),
-        )
-    with col_q2:
-        drug = st.text_input(T("（可选）指定药品名", "(Optional) Specify drug name"), value="")
-        topn = st.slider(T("返回条数", "Top-N results"), min_value=4, max_value=20, value=8, step=1)
-        method = st.selectbox(
-            T("重排序/融合", "Rerank/Fusion"),
-            ["rrf", "none", "ce"],
-            index=0,
-            help=T("rrf=稳健融合；ce=交叉编码器；none=不重排", "rrf=robust fusion; ce=cross-encoder; none=no rerank"),
-        )
-
-    btn_run = st.button(T("🧭 检索并生成建议", "🧭 Retrieve & Draft Suggestion"), type="primary")
-
-# ---------------------------------------------------------------------
-# 主动作：检索 + 组织草案
-# ---------------------------------------------------------------------
-suggest_md: str = ""           # 建议（Markdown）
-evidence_items: List[Dict[str, Any]] = []
-drug_structured: List[Dict[str, Any]] = []
-elapsed_sec = 0.0
-now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-def _mk_md_header(text: str) -> str:
-    return f"**{text}**\n"
-
-def _format_hit_md(hit: Dict[str, Any], idx: int) -> str:
-    """将单条命中渲染为 MD（标题 + 片段 + 来源）"""
-    m = hit.get("meta") or {}
-    title = m.get("title") or T("未命名", "Untitled")
-    src = m.get("source") or "-"
-    yr = m.get("year") or "-"
-    body = (hit.get("doc") or "").strip()
-    body = re.sub(r"\s+", " ", body)
-    body = body[:600] + ("…" if len(body) > 600 else "")
-    return f"{idx}. **{title}**（{yr}，{src}）\n\n> {body}\n"
-
-def _draft_suggestion_cn(question: str, hits: List[Dict[str, Any]], drug_name: Optional[str]) -> str:
-    """中文草案（可按需替换为你的结构化提示输出）"""
-    bullets = []
-    if drug_name:
-        bullets.append(f"- 优先围绕 **{drug_name}** 的适应证/禁忌证/相互作用进行核对。")
-    bullets.append("- 优先考虑权威指南与共识推荐；结合患者伴随疾病进行个体化权衡。")
-    bullets.append("- 注意监测用药后可能的不良反应与疗效指标，必要时及时复评。")
-    hint = "\n".join(bullets)
-
-    if "哮喘" in question and ("β" in question or "beta" in question.lower()):
-        # 针对示例问题给出保守医学常识占位（非处方建议）
-        domain_hint = (
-            "对于合并支气管哮喘的高血压患者，通常**避免使用非选择性 β 受体阻滞剂**；"
-            "若有强适应证（如缺血性心脏病等），可**慎用 β1 选择性**药物并从低剂量开始，密切监测气道反应。"
-            "降压方案可优先考虑 ACEI/ARB 或长效二氢吡啶类钙拮抗剂。"
-        )
-    else:
-        domain_hint = "请结合患者人群特征、并发症与药物相互作用做个体化优化。"
-
-    md = []
-    md.append(_mk_md_header("临床建议（草案）"))
-    md.append(f"问题: {question.strip() or '（未输入）'}")
-    md.append("")
-    md.append(domain_hint)
-    md.append("")
-    md.append(hint)
-    md.append("")
-    md.append("合规提示：本工具仅供临床决策参考，不代替医生诊断与处方。")
-    return "\n".join(md)
-
-def _draft_suggestion_en(question: str, hits: List[Dict[str, Any]], drug_name: Optional[str]) -> str:
-    bullets = []
-    if drug_name:
-        bullets.append(f"- Prioritize verifying **{drug_name}** indications/contraindications/interactions.")
-    bullets.append("- Prefer recommendations from authoritative guidelines and consensus; individualize to comorbidities.")
-    bullets.append("- Monitor efficacy and adverse events, and re-assess when needed.")
-    hint = "\n".join(bullets)
-
-    if "asthma" in question.lower() and ("β" in question or "beta" in question.lower()):
-        domain_hint = (
-            "In hypertensive patients with bronchial asthma, generally **avoid non-selective β-blockers**; "
-            "if a strong indication exists (e.g., ischemic heart disease), consider **β1-selective** agents with caution and close airway monitoring. "
-            "ACEI/ARB or long-acting dihydropyridine CCBs are reasonable options for hypertension."
-        )
-    else:
-        domain_hint = "Individualize therapy by phenotype, comorbidities, and drug–drug interactions."
-
-    md = []
-    md.append(_mk_md_header("Clinical Suggestion (Draft)"))
-    md.append(f"Question: {question.strip() or '(empty)'}")
-    md.append("")
-    md.append(domain_hint)
-    md.append("")
-    md.append(hint)
-    md.append("")
-    md.append("Compliance: This tool assists clinical decision-making and does not replace medical judgment.")
-    return "\n".join(md)
-
-def _make_suggestion_md(question: str, hits: List[Dict[str, Any]], drug_name: Optional[str]) -> str:
-    return _draft_suggestion_cn(question, hits, drug_name) if LANG == "中文" else _draft_suggestion_en(question, hits, drug_name)
-
-def _mk_filename(prefix: str, ext: str = ".md") -> str:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe = re.sub(r"[^\w\-]+", "_", prefix.strip())[:32] or "CareMind"
-    return f"{safe}_{ts}{ext}"
-
-if btn_run:
-    t0 = time.time()
-    # 1) 文本检索（统一入口：内部做向量检索 + 关键词兜底；可选 ce 重排）
+    Secrets-aware env reader:
+    优先 st.secrets[key]，其后 os.environ[key]，最后 default。
+    """
     try:
-        res = R.retrieve(
-            q or "",
-            R.RetrieveOptions(topn=int(topn), method=method)
+        return os.getenv(key, st.secrets.get(key, default))
+    except Exception:
+        return os.getenv(key, default)
+
+def link_citations(md: str) -> str:
+    """
+    将 "[#3]" 或 "[3]" 转为页面锚点 "#hit-3"，便于从建议跳回证据片段。
+    """
+    return re.sub(r"\[(?:#)?(\d+)\]", r"[\1](#hit-\1)", md or "")
+
+def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
+    """
+    将证据片段渲染为 Markdown（用于下载）。
+    """
+    lines = []
+    for i, h in enumerate(hits or [], 1):
+        m = h.get("meta") or {}
+        title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
+        source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
+        year   = str(m.get("year")   or "—")
+        head = f"### #{i} {title}\n\n" + (f"- 来源：{source} · 年份：{year}\n\n" if lang=="zh"
+                                          else f"- Source: {source} · Year: {year}\n\n")
+        lines.append(head + (h.get("content") or "") + "\n")
+    return "\n".join(lines)
+
+def friendly_hints(lang: str, exc: Exception) -> List[str]:
+    """把常见后端异常翻译成友好的排障提示。"""
+    msg = str(exc).lower()
+    zh = (lang == "zh")
+    tips = []
+    if "chromadb" in msg:
+        tips.append("· 检查 CHROMA_PERSIST_DIR / CHROMA_COLLECTION" if zh else
+                    "· Check CHROMA_PERSIST_DIR / CHROMA_COLLECTION")
+    if "sqlite" in msg:
+        tips.append("· 检查 SQLite 路径与表结构" if zh else
+                    "· Verify SQLite path & schema")
+    if "cuda" in msg or "cudnn" in msg:
+        tips.append("· 检查 CUDA/cuDNN 或切到 CPU" if zh else
+                    "· Check CUDA/cuDNN or switch to CPU")
+    if "module" in msg and "not found" in msg:
+        tips.append("· 确认 rag/__init__.py 与导入路径" if zh else
+                    "· Ensure rag/__init__.py and import path")
+    return tips
+
+
+# =============================================================================
+# 1) 极简 i18n（页面文案；pipeline 内部生成的文本已在后端本地化）
+# -----------------------------------------------------------------------------
+I18N: Dict[str, Dict[str, str]] = {
+    "zh": {
+        "title": "CareMind · 临床决策支持（MVP）",
+        "question_label": "输入临床问题",
+        "question_ph": "例如：慢性肾病（CKD）患者使用 ACEI/ARB 时如何监测？多久复查？",
+        "drug_label": "（可选）指定药品名（如：阿司匹林）",
+        "submit": "生成建议",
+        "tab_advice": "🧭 建议",
+        "tab_hits": "📚 证据片段",
+        "tab_drug": "💊 药品结构化",
+        "tab_log": "🪵 运行日志",
+        "settings": "⚙️ 设置",
+        "k_slider": "检索片段数（Top-K）",
+        "show_meta": "显示片段元数据",
+        "expand_hits": "展开所有片段",
+        "filters": "🧩 证据筛选（前端）",
+        "filter_src": "按来源包含过滤（可留空）",
+        "filter_year": "年份范围",
+        "presets": "🧪 问题模板",
+        "preset_select": "快速选择",
+        "preset_none": "——",
+        "preset1": "CKD 合并高血压 ACEI/ARB 监测",
+        "preset2": "老年合并 T2DM+CAD：降压目标与方案",
+        "preset3": "GDM 胰岛素起始（指征与剂量）",
+        "advice_hdr": "建议（含引用与合规声明）",
+        "time_used": "⏱️ 用时：{:.2f}s",
+        "export_advice": "导出建议（Markdown）",
+        "export_evidence": "导出证据（Markdown）",
+        "disclaimer": "⚠️ 本工具仅供临床决策参考，不替代医师诊断与处方。",
+        "hits_hdr": "检索片段（Top-{k}，过滤后 {n} 条）",
+        "no_hits": "未检索到符合筛选条件的片段。",
+        "drug_hdr": "药品结构化信息（SQLite）",
+        "no_drug": "未提供或未检索到对应药品的结构化信息。",
+        "log_export": "导出本会话全部日志（JSON）",
+        "history_hdr": "🗂️ 本会话历史（点击复用）",
+        "no_history": "暂无历史记录。",
+        "reuse": "复用",
+        "reused_tip": "已复用：{q}（药品：{drug}，K={k}）。可编辑后再次生成。",
+        "page_footer": "© CareMind · MVP CDSS | 本工具仅供临床决策参考，不替代医师诊断与处方。",
+        "chips_src": "来源：",
+        "chips_year": "年份：",
+        "chips_id": "ID：",
+        "stats_hits": "片段数：{n} · 总字数：{c}",
+        "warn_need_q": "请输入临床问题后再生成建议。",
+        "err_backend": "后端错误（详见下方日志/诊断）。",
+        "diag_title": "运行日志 / 环境诊断",
+        "diag_cfg": "有效配置（优先 Secrets）",
+        "diag_chroma": "Chroma 集合：",
+        "diag_chroma_err": "Chroma 访问错误：",
+        "diag_sqlite": "SQLite 表：",
+        "diag_sqlite_err": "SQLite 错误：",
+    },
+    "en": {
+        "title": "CareMind · Clinical Decision Support (MVP)",
+        "question_label": "Enter your clinical question",
+        "question_ph": "e.g., For CKD patients on ACEI/ARB, how to monitor and how often?",
+        "drug_label": "(Optional) Drug name (e.g., Aspirin)",
+        "submit": "Generate Advice",
+        "tab_advice": "🧭 Advice",
+        "tab_hits": "📚 Evidence",
+        "tab_drug": "💊 Drug (Structured)",
+        "tab_log": "🪵 Run Logs",
+        "settings": "⚙️ Settings",
+        "k_slider": "Top-K retrieved segments",
+        "show_meta": "Show snippet metadata",
+        "expand_hits": "Expand all snippets",
+        "filters": "🧩 Evidence Filters (client-side)",
+        "filter_src": "Filter by source (optional, substring)",
+        "filter_year": "Year range",
+        "presets": "🧪 Question Presets",
+        "preset_select": "Quick pick",
+        "preset_none": "——",
+        "preset1": "Monitoring ACEI/ARB in CKD + Hypertension",
+        "preset2": "Elderly with T2DM+CAD: target BP and first-line therapy",
+        "preset3": "GDM: when to start insulin",
+        "advice_hdr": "Advice (with citations & compliance note)",
+        "time_used": "⏱️ Elapsed: {:.2f}s",
+        "export_advice": "Export Advice (Markdown)",
+        "export_evidence": "Export Evidence (Markdown)",
+        "disclaimer": "⚠️ For clinical reference only. Not a substitute for diagnosis/prescription.",
+        "hits_hdr": "Retrieved segments (Top-{k}, {n} after filtering)",
+        "no_hits": "No snippets match the current filters.",
+        "drug_hdr": "Drug Structured Info (SQLite)",
+        "no_drug": "No structured drug info provided or found.",
+        "log_export": "Export session logs (JSON)",
+        "history_hdr": "🗂️ Session History (click to reuse)",
+        "no_history": "No history yet.",
+        "reuse": "Reuse",
+        "reused_tip": "Reused: {q} (Drug: {drug}, K={k}). Edit then generate again.",
+        "page_footer": "© CareMind · MVP CDSS | For clinical reference only.",
+        "chips_src": "Source:",
+        "chips_year": "Year:",
+        "chips_id": "ID:",
+        "stats_hits": "Snippets: {n} · Total chars: {c}",
+        "warn_need_q": "Please enter a clinical question first.",
+        "err_backend": "Backend error (see logs/diagnostics below).",
+        "diag_title": "Runtime Log / Diagnostics",
+        "diag_cfg": "Effective config (Secrets-first):",
+        "diag_chroma": "Chroma collections:",
+        "diag_chroma_err": "Chroma access error: ",
+        "diag_sqlite": "SQLite tables:",
+        "diag_sqlite_err": "SQLite error: ",
+    },
+}
+def t(lang: str, key: str) -> str:
+    return I18N.get(lang, I18N["zh"]).get(key, key)
+
+
+# =============================================================================
+# 2) 页面配置 & 轻量样式
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="CareMind · MVP CDSS", layout="wide", page_icon="💊")
+st.markdown("""
+<style>
+.cm-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;background:#eef2ff;border:1px solid #c7d2fe;margin-right:6px;white-space:nowrap;}
+.cm-chip{display:inline-block;padding:2px 8px;border-radius:8px;font-size:12px;background:#f1f5f9;border:1px solid #e2e8f0;margin:0 6px 6px 0;}
+.cm-muted{color:#64748b;font-size:13px;}
+.cm-output{line-height:1.75;font-size:17px;}
+.cm-card{border:1px solid #e5e7eb;background:#fff;border-radius:12px;padding:12px 14px;margin-bottom:10px;}
+footer{visibility:hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# =============================================================================
+# 3) 侧边栏
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    lang = st.selectbox("Language / 语言", options=["zh", "en"], index=0,
+                        format_func=lambda x: "中文" if x == "zh" else "English")
+    st.header(t(lang, "settings"))
+
+    k = st.slider(t(lang, "k_slider"), min_value=2, max_value=8, value=4, step=1)
+    show_meta = st.toggle(t(lang, "show_meta"), value=True)
+    expand_hits = st.toggle(t(lang, "expand_hits"), value=False)
+
+    st.divider()
+    st.markdown(f"#### {t(lang, 'filters')}")
+    src_filter = st.text_input(t(lang, "filter_src"))
+    year_min, year_max = st.slider(t(lang, "filter_year"), 2000, 2035, (2005, 2035))
+    st.divider()
+
+    st.markdown(f"#### {t(lang, 'presets')}")
+    presets = {
+        "zh": {
+            t("zh","preset1"): "慢性肾病（CKD）患者使用 ACEI/ARB 时如何监测？多久复查？",
+            t("zh","preset2"): "老年合并糖尿病与冠心病的降压目标与首选方案？",
+            t("zh","preset3"): "妊娠期糖尿病控制不佳时胰岛素起始指征与剂量？",
+        },
+        "en": {
+            t("en","preset1"): "For CKD on ACEI/ARB, what to monitor and how often?",
+            t("en","preset2"): "Elderly with T2DM+CAD: target BP and first-line therapy?",
+            t("en","preset3"): "GDM: when to start insulin and starting dose?",
+        }
+    }
+    preset_none = t(lang, "preset_none")
+    preset_choice = st.selectbox(t(lang, "preset_select"),
+                                 options=[preset_none] + list(presets[lang].keys()),
+                                 index=0)
+
+    # 会话历史（侧边栏显示概览）
+    st.markdown(f"#### {t(lang, 'history_hdr')}")
+    hist = st.session_state.setdefault("cm_history", [])
+    if not hist:
+        st.caption(t(lang, "no_history"))
+    else:
+        for idx, h in enumerate(reversed(hist[-8:]), 1):
+            st.write(f"{idx}. {h.get('q')[:36]}{'...' if len(h.get('q'))>36 else ''}")
+            if st.button(t(lang, "reuse"), key=f"reuse_side_{idx}"):
+                st.session_state["prefill"] = h
+
+# =============================================================================
+# 4) 输入区
+# -----------------------------------------------------------------------------
+st.title(t(lang, "title"))
+with st.form("cm_query"):
+    prefill = st.session_state.pop("prefill", None)
+    q_init = (prefill or {}).get("q") or (presets[lang].get(preset_choice, "") if preset_choice != preset_none else "")
+    k_pref = (prefill or {}).get("k")
+    if k_pref is not None:
+        k = int(k_pref)
+
+    q = st.text_input(t(lang, "question_label"),
+                      placeholder=t(lang, "question_ph"),
+                      value=q_init)
+    drug = st.text_input(t(lang, "drug_label"), value=(prefill or {}).get("drug", ""))
+    submitted = st.form_submit_button(t(lang, "submit"), use_container_width=True)
+
+
+# =============================================================================
+# 5) 结果页签
+# -----------------------------------------------------------------------------
+tab_adv, tab_hits, tab_drug, tab_log = st.tabs([
+    t(lang, "tab_advice"),
+    t(lang, "tab_hits"),
+    t(lang, "tab_drug"),
+    t(lang, "tab_log"),
+])
+
+res: Optional[Dict[str, Any]] = None
+elapsed: Optional[float] = None
+
+
+# =============================================================================
+# 6) 调用后端（反射式，兼容是否含 lang 参数）
+# -----------------------------------------------------------------------------
+if submitted:
+    if not (q and q.strip()):
+        st.warning(t(lang, "warn_need_q"))
+    else:
+        with st.spinner("..."):
+            try:
+                t0 = time.time()
+                sig_params = inspect.signature(cm_pipeline.answer).parameters
+                if "lang" in sig_params:
+                    res = cm_pipeline.answer(
+                        q.strip(), drug_name=(drug.strip() or None), k=int(k), lang=lang
+                    )
+                else:
+                    res = cm_pipeline.answer(
+                        q.strip(), drug_name=(drug.strip() or None), k=int(k)
+                    )
+                elapsed = time.time() - t0
+
+                # 记录到会话历史
+                st.session_state.setdefault("cm_history", []).append(
+                    {"q": q.strip(), "drug": (drug.strip() or None), "k": int(k), "time": time.time()}
+                )
+            except Exception as e:
+                st.error(t(lang, "err_backend"))
+                hints = friendly_hints(lang, e)
+                if hints:
+                    st.info("· " + "\n· ".join(hints))
+                st.exception(e)
+                res = None
+
+
+# =============================================================================
+# 7) 渲染结果
+# -----------------------------------------------------------------------------
+if res:
+    # --- 建议 ---
+    with tab_adv:
+        st.subheader(t(lang, "advice_hdr"))
+        output_text = link_citations(res.get("output") or "")
+        st.markdown(f"<div class='cm-output'>{output_text}</div>", unsafe_allow_html=True)
+        if elapsed is not None:
+            st.caption(t(lang, "time_used").format(elapsed))
+        # 1) full-width preview
+        st.code(output_text, language="markdown")
+        # 2) compact downloads below, side-by-side
+        ev_md = evidence_md(lang, res.get("guideline_hits") or [])
+        b1, b2, _spacer = st.columns([1, 1, 4])
+        with b1:
+            st.download_button(
+            t(lang, "export_advice"),
+            data=(output_text or "").encode("utf-8"),
+            file_name="caremind_advice.md",
+            mime="text/markdown",
+            use_container_width=True,
+                disabled=not bool((output_text or "").strip()),
         )
-        evidence_items = res.get("hits") or []
-        elapsed_sec = float(res.get("t_sec") or 0.0)
-    except Exception as e:
-        st.error(T(f"检索失败：{e}", f"Retrieval failed: {e}"))
-        evidence_items = []
-        elapsed_sec = time.time() - t0
+        with b2:
+            st.download_button(
+            t(lang, "export_evidence"),
+            data=(ev_md or "").encode("utf-8"),
+            file_name="caremind_evidence.md",
+            mime="text/markdown",
+            use_container_width=True,
+            disabled=not bool((ev_md or "").strip()),
+            )
+        st.caption(t(lang, "disclaimer"))
 
-    # 2) 药品结构化查询（可选）
-    if drug.strip():
-        try:
-            drug_structured = R.lookup_drug(drug.strip(), limit=5) or []
-        except Exception as e:
-            st.warning(T(f"药品结构化查询失败：{e}", f"Drug lookup failed: {e}"))
+    # --- 证据片段 ---
+    with tab_hits:
+        hits: List[Dict[str, Any]] = res.get("guideline_hits") or []
 
-    # 3) 草案生成（简单模板；你也可以换成 Structured Prompt）
-    suggest_md = _make_suggestion_md(q, evidence_items, drug.strip() or None)
+        def pass_filter(h: Dict[str, Any]) -> bool:
+            m = h.get("meta") or {}
+            src_ok = (src_filter.strip().lower() in (m.get("source", "").lower())) if src_filter.strip() else True
+            try:
+                y = int(m.get("year"))
+            except Exception:
+                y = None
+            year_ok = (year_min <= y <= year_max) if y else True
+            return src_ok and year_ok
 
-# ---------------------------------------------------------------------
-# 展示区：建议 / 证据片段 / 药品结构化 / 导出按钮
-# ---------------------------------------------------------------------
-col_a, col_b = st.columns([2.2, 1], gap="large")
-
-with col_a:
-    st.subheader(T("🧭 建议", "🧭 Suggestion"))
-    if suggest_md:
-        st.markdown(suggest_md)
-        st.caption(T(f"⏱️ 用时：{elapsed_sec:.2f}s", f"⏱️ Time: {elapsed_sec:.2f}s"))
-    else:
-        st.info(T("尚未生成建议。", "No suggestion yet."))
-
-    st.markdown("---")
-    st.subheader(T("📚 证据片段", "📚 Evidence Snippets"))
-    if evidence_items:
-        ev_md_parts = []
-        for i, h in enumerate(evidence_items, 1):
-            block = _format_hit_md(h, i)
-            st.markdown(block)
-            ev_md_parts.append(block)
-    else:
-        st.warning(T("暂无证据片段（可能因向量库不命中或关键词过泛）。", "No evidence snippets yet (vector store miss or query too broad)."))
-
-    # 导出按钮（更紧凑 + 判空）
-    st.markdown("")
-    with st.container():
-        c1, c2 = st.columns([0.24, 0.24])
-        with c1:
-            with st.container():
-                st.markdown('<div class="small-btn">', unsafe_allow_html=True)
-                if st.button(T("⬇️ 导出建议(MD)", "⬇️ Export Suggestion (MD)")):
-                    if suggest_md.strip():
-                        fn = _mk_filename("CareMind_Suggestion")
-                        st.download_button(
-                            label=T("下载", "Download"),
-                            data=suggest_md,
-                            file_name=fn,
-                            mime="text/markdown",
-                            key="dl_suggest",
-                        )
-                    else:
-                        st.warning(T("无可导出的建议内容。", "Nothing to export."))
-                st.markdown("</div>", unsafe_allow_html=True)
-        with c2:
-            with st.container():
-                st.markdown('<div class="small-btn">', unsafe_allow_html=True)
-                if st.button(T("⬇️ 导出证据(MD)", "⬇️ Export Evidence (MD)")):
-                    if evidence_items:
-                        fn = _mk_filename("CareMind_Evidence")
-                        md = []
-                        md.append(_mk_md_header(T("证据片段", "Evidence")))
-                        for i, h in enumerate(evidence_items, 1):
-                            md.append(_format_hit_md(h, i))
-                        data = "\n".join(md)
-                        st.download_button(
-                            label=T("下载", "Download"),
-                            data=data,
-                            file_name=fn,
-                            mime="text/markdown",
-                            key="dl_evidence",
-                        )
-                    else:
-                        st.warning(T("当前无可导出的证据。", "No evidence to export."))
-                st.markdown("</div>", unsafe_allow_html=True)
-
-with col_b:
-    st.subheader(T("💊 药品结构化", "💊 Drug (Structured)"))
-    if drug.strip():
-        if drug_structured:
-            for row in drug_structured:
-                with st.container():
-                    st.markdown("**" + (row.get("name") or "-") + "**")
-                    st.caption((row.get("aliases") or "")[:200])
-                    st.markdown(T("**适应症**", "**Indication**") + f": {row.get('indication') or '-'}")
-                    st.markdown(T("**禁忌**", "**Contraindication**") + f": {row.get('contraindication') or '-'}")
-                    st.markdown(T("**相互作用**", "**Interactions**") + f": {row.get('interactions') or '-'}")
-                    st.markdown(T("**妊娠分级**", "**Pregnancy**") + f": {row.get('pregnancy') or '-'}")
-                    st.markdown(T("**来源**", "**Source**") + f": {row.get('source') or '-'}")
-                    st.markdown("---")
+        hits = [h for h in hits if pass_filter(h)]
+        st.subheader(t(lang, "hits_hdr").format(k=k, n=len(hits)))
+        if not hits:
+            st.info(t(lang, "no_hits"))
         else:
-            st.info(T("未在本地药品库中找到匹配项。", "No match found in the local drug DB."))
-    else:
-        st.caption(T("输入药品名以查看结构化信息。", "Enter a drug name to view structured info."))
+            counts: Dict[str, int] = {}
+            for h in hits:
+                m = h.get("meta") or {}
+                s = str(m.get("source") or ("未知来源" if lang == "zh" else "Unknown")).strip()
+                counts[s] = counts.get(s, 0) + 1
+            st.markdown(" ".join(
+                [f"<span class='cm-chip'>{s} × {n}</span>" for s, n in counts.items()]
+            ), unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------
-# 运行日志 / 环境诊断（**关键修复点：使用 retriever 的新 API**）
-# ---------------------------------------------------------------------
-st.markdown("---")
-st.subheader(T("🪵 运行日志 / 环境诊断", "🪵 Runtime Log / Health Check"))
+            for i, h in enumerate(hits, 1):
+                m = h.get("meta") or {}
+                title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
+                source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
+                year   = str(m.get("year")   or "—")
+                doc_id = str(m.get("id")     or "—")
+                label = f"#{i} · {title[:60]}"
+                st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
+                with st.expander(label, expanded=bool(expand_hits)):
+                    if show_meta:
+                        st.markdown(
+                            f"<div class='cm-muted'>"
+                            f"<span class='cm-badge'>{t(lang, 'chips_src')} {source}</span>"
+                            f"<span class='cm-badge'>{t(lang, 'chips_year')} {year}</span>"
+                            f"<span class='cm-badge'>{t(lang, 'chips_id')} {doc_id}</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown(h.get("content") or ("（空片段）" if lang == "zh" else "(empty)"))
 
-try:
-    info = R.print_health()  # ✅ 新版封装（内部已用 list_collections()/peek_collection()）
-    # 顶部摘要
-    st.markdown(
-        f"""
-        <div class="ok-box mono">
-          Retriever version: {RETRIEVER_VERSION}<br/>
-          Chroma 目录存在： {info['chroma'].get('dir')} → {str(info['chroma'].get('dir_exists'))}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # --- 药品结构化 ---
+    with tab_drug:
+        st.subheader(t(lang, "drug_hdr"))
+        if res.get("drug"):
+            st.json(res["drug"], expanded=False)
+        else:
+            st.caption(t(lang, "no_drug"))
 
-    # 环境
-    with st.expander(T("环境变量", "Environment"), expanded=False):
-        st.code(json.dumps(info.get("env", {}), ensure_ascii=False, indent=2), language="json")
+    # --- 运行日志 ---
+    with tab_log:
+        log = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "lang": lang,
+            "question": q.strip(),
+            "drug": drug.strip() or None,
+            "k": int(k),
+            "elapsed_sec": round(elapsed or 0, 3),
+            "sources": [ (h.get("meta") or {}).get("source") for h in (res.get("guideline_hits") or []) ],
+        }
+        st.json(log)
+        st.download_button(
+            t(lang, "log_export"),
+            data=json.dumps([log], ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="caremind_logs.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
-    # Chroma 集合列表
-    with st.expander(T("Chroma 集合", "Chroma Collections"), expanded=False):
-        st.code(json.dumps(info.get("chroma", {}).get("collections", []), ensure_ascii=False, indent=2), language="json")
 
-    # 快速抽样（peek） —— **不再访问 max_seq_id**
-    with st.expander(T("Chroma 快速抽样（peek）", "Chroma Peek"), expanded=False):
-        st.code(json.dumps(info.get("chroma", {}).get("peek", []), ensure_ascii=False, indent=2), language="json")
+# =============================================================================
+# 8) 诊断面板（始终可见；使用 retriever.list_collections_safe）
+# -----------------------------------------------------------------------------
+def render_diagnostics(lang: str = "zh") -> None:
+    title = t(lang, "diag_title")
+    with st.expander(title, expanded=False):
+        # 有效配置（Secrets 优先）
+        keys = ["CAREMIND_DEMO", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION",
+                "EMBEDDING_MODEL", "DRUG_DB_PATH"]
+        eff = {k: _env(k, None) for k in keys}
+        st.write(t(lang, "diag_cfg"))
+        st.code(json.dumps(eff, ensure_ascii=False, indent=2))
+        # ✅ 显示 retriever 版本号，确认云端是否更新到位
+        st.write("Retriever version:", getattr(R, "VERSION", "unknown"))
 
-    # SQLite
-    st.caption(T(
-        f"SQLite 文件存在： {info.get('sqlite', {}).get('path')} → {str(info.get('sqlite', {}).get('exists'))}",
-        f"SQLite exists: {info.get('sqlite', {}).get('path')} → {str(info.get('sqlite', {}).get('exists'))}",
-    ))
-    if info.get("sqlite", {}).get("tables"):
-        st.code(json.dumps(info.get("sqlite", {}).get("tables"), ensure_ascii=False, indent=2), language="json")
+        # Chroma 目录存在性
+        chroma_dir = eff.get("CHROMA_PERSIST_DIR") or "./chroma_store"
+        abs_chroma = os.path.abspath(chroma_dir)
+        st.write(f"{'Chroma 目录存在：' if lang=='zh' else 'Chroma dir exists:'} "
+                 f"{abs_chroma} → {os.path.exists(abs_chroma)}")
 
-    # 关键词直搜（**修复点**：使用 retriever.keyword_get，而非 query(where_document=...)）
-    with st.expander(T("where_document 直搜（不走向量）", "where_document direct search (non-vector)"), expanded=False):
-        kw = st.text_input(T("关键词（示例：哮喘）", "Keyword (e.g., asthma)"), value="哮喘", key="kw_demo")
-        if st.button(T("执行直搜", "Run keyword search"), key="btn_kw_demo"):
-            hits = R.keyword_get(kw, limit=5)  # ✅ 正确用法
-            st.code(json.dumps(hits, ensure_ascii=False, indent=2), language="json")
+        # 集合与条数（安全方式；避免 _type）
+        try:
+            cols = R.list_collections_safe()
+            st.write(t(lang, "diag_chroma"))
+            st.json(cols)
+        except Exception as e:
+            st.warning(t(lang, "diag_chroma_err") + str(e))
 
-except Exception as e:
-    st.markdown(
-        f'<div class="warn-box mono">Chroma 访问错误：{e}</div>',
-        unsafe_allow_html=True
-    )
+        # SQLite 存在性与表
+        db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
+        abs_db = os.path.abspath(db_path)
+        st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
+                 f"{abs_db} → {os.path.exists(abs_db)}")
+        try:
+            import sqlite3
+            con = sqlite3.connect(abs_db)
+            cur = con.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall()]
+            con.close()
+            st.write(t(lang, "diag_sqlite"))
+            st.json(tables)
+        except Exception as e:
+            st.warning(t(lang, "diag_sqlite_err") + str(e))
 
-# ---------------------------------------------------------------------
-# 页脚与合规声明
-# ---------------------------------------------------------------------
-st.markdown("---")
-st.caption(
-    T(
-        "⚠️ 本工具用于教学与演示，不直接用于临床决策；请以最新指南与专科医师判断为准。",
-        "⚠️ For education and demonstration only; consult up-to-date guidelines and specialist judgment."
-    )
-)
+# 页面底部渲染诊断
+render_diagnostics(lang)
+
+
+# =============================================================================
+# 9) 页脚
+# -----------------------------------------------------------------------------
+st.caption(t(lang, "page_footer"))
