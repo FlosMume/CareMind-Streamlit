@@ -13,7 +13,9 @@ Design goals
    - Lazy-import Chroma so that missing/old system libs won’t crash the module
      import (errors appear only when the functions are executed).
 2) Keep **one** Chroma client and **one** collection cache to avoid duplicate
-   stacks and race conditions across hot-reloads.
+   stacks and race conditions across hot-reloads. (Uses st.cache_resource when
+   available to prevent “An instance of Chroma already exists …with different
+   settings”.)
 3) Pre-migrate Chroma sysdb (`collections.configuration`) to insert a minimal
    JSON with `_type` when missing — this unblocks older Chroma stores.
 4) Provide **stable public API** that `rag/pipeline.py` already calls:
@@ -22,7 +24,8 @@ Design goals
    …and keep extra helpers you will likely need soon:
       - hybrid_search(query, k=8, use_sqlite=True) with RRF fusion
       - _sqlite_search_drugfacts(name_substr, topn=5) -> List[dict]
-5) Rich logs to diagnose Cloud issues quickly.
+5) Rich logs to diagnose Cloud issues quickly and a `primary_collection_count()`
+   helper so Streamlit can show “chunks available”.
 
 Environment variables
 ---------------------
@@ -55,12 +58,16 @@ os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "false")
 
 CHROMA_TELEMETRY_OFF = os.getenv("CHROMA_TELEMETRY_OFF", "1") not in ("0", "false", "False")
 
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+# Use absolute path to avoid ambiguity across working dirs / reloads
+def _abs(p: str) -> str:
+    return os.path.abspath(os.path.expanduser(p))
+
+CHROMA_PERSIST_DIR = _abs(os.getenv("CHROMA_PERSIST_DIR", "./chroma_store"))
 CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION",  "guideline_chunks")
 EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL",    "BAAI/bge-large-zh-v1.5")
-DRUG_DB_PATH       = os.getenv("DRUG_DB_PATH",       "./db/drugs.sqlite")
+DRUG_DB_PATH       = _abs(os.getenv("DRUG_DB_PATH",  "./db/drugs.sqlite"))
 
-VERSION = "retriever-2025-09-28"
+VERSION = "retriever-2025-09-30"
 
 def _log(*msg: Any) -> None:
     """Single place for retriever logs (helps when debugging Cloud deploys)."""
@@ -132,9 +139,19 @@ class _ChromaEmbedFn:
 
 _EMBED = _LazyEmbedder(EMBEDDING_MODEL)
 
-# Caches (survive Streamlit hot-reloads in many cases)
-_CLIENT = None
-_COLLECTION = None
+# =============================================================================
+# 3) Streamlit-friendly caching primitives (one client per process)
+# =============================================================================
+try:
+    import streamlit as st
+    cache_resource = st.cache_resource
+except Exception:
+    def cache_resource(func):  # no-op fallback
+        return func
+
+# =============================================================================
+# 4) Lazy import Chroma
+# =============================================================================
 
 def _chroma_import():
     """Import Chroma on demand."""
@@ -149,7 +166,7 @@ def _chroma_import():
 
 
 # =============================================================================
-# 3) Chroma sysdb pre-migration (fix missing configuration._type)
+# 5) Chroma sysdb pre-migration (fix missing configuration._type)
 # =============================================================================
 
 def _sysdb_paths(persist_dir: str) -> List[str]:
@@ -192,7 +209,7 @@ def _premigrate_sysdb(persist_dir: str) -> int:
             fixed = 0
             for cid, conf in rows:
                 if not _has_type(conf):
-                    payload = json.dumps({"_type":"CollectionConfigurationInternal"}, ensure_ascii=False)
+                    payload = json.dumps({"_type": "CollectionConfigurationInternal"}, ensure_ascii=False)
                     cur.execute("UPDATE collections SET configuration=? WHERE id=?", (payload, cid))
                     fixed += 1
             if fixed:
@@ -204,63 +221,63 @@ def _premigrate_sysdb(persist_dir: str) -> int:
         finally:
             with contextlib.suppress(Exception):
                 con.close()
-    return tota
+    return total  # <-- fixed (was a typo `tota`)
 
 
 # =============================================================================
-# 4) Client / collection getters (single, cached)
+# 6) Client / collection getters (single, cached, consistent Settings)
 # =============================================================================
 
-def get_chroma_client(persist_dir: Optional[str] = None):
-    """Create (once) and return a PersistentClient, after a best-effort premigrate."""
-    global _CLIENT
-    if _CLIENT is not None:
-        return _CLIENT
-    pdir = (persist_dir or CHROMA_PERSIST_DIR)
-    os.makedirs(pdir, exist_ok=True)
+@cache_resource
+def get_chroma_client():
+    """
+    Create (once) and return a PersistentClient, after a best-effort premigrate.
+    Using st.cache_resource guarantees a single instance per Streamlit process,
+    preventing 'An instance of Chroma already exists …with different settings'.
+    """
+    os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
     # best-effort migration before touching Chroma
     try:
-        changed = _premigrate_sysdb(pdir)
+        changed = _premigrate_sysdb(CHROMA_PERSIST_DIR)
         if changed:
             _log(f"Premigrated collections: {changed}")
     except Exception as e:
         _log("Premigrate skipped due to error:", repr(e))
     PersistentClient, Settings = _chroma_import()
-    _CLIENT = PersistentClient(
-        path=pdir,
-        settings=Settings(anonymized_telemetry=not CHROMA_TELEMETRY_OFF, allow_reset=True),
+    # IMPORTANT: keep Settings EXACTLY the same everywhere
+    return PersistentClient(
+        path=CHROMA_PERSIST_DIR,
+        settings=Settings(
+            anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
+            allow_reset=False,
+        ),
     )
-    return _CLIENT
 
-def get_chroma_collection(name: Optional[str] = None, embed_model: Optional[str] = None):
+@cache_resource
+def get_chroma_collection():
     """
-    Open (and cache) the primary collection.
-    Retry once after premigration if creation fails (covers broken stores).
+    Open and cache the primary collection.
+    We try to *get* first (don’t silently create a fresh, empty one),
+    so that diagnostics reflect a genuinely missing collection.
     """
-    global _COLLECTION
-    if _COLLECTION is not None:
-        return _COLLECTION
     client = get_chroma_client()
-    embed_fn = _ChromaEmbedFn(_EMBED if not embed_model else _LazyEmbedder(embed_model))
-    target = (name or CHROMA_COLLECTION)
+    embed_fn = _ChromaEmbedFn(_EMBED)
+    # Try to get existing; if missing, log available names to help debugging
     try:
-        _COLLECTION = client.get_or_create_collection(name=target, embedding_function=embed_fn)
-        return _COLLECTION
-    except Exception as e:
-        _log("get_or_create_collection failed:", repr(e))
-        _log("Retry after premigration …")
-        try:
-            _premigrate_sysdb(CHROMA_PERSIST_DIR)
-        except Exception as e2:
-            _log("Premigrate during retry failed:", repr(e2))
-        # retry once
-        _COLLECTION = client.get_or_create_collection(name=target, embedding_function=embed_fn)
-        _log("Collection opened after migrate+retry.")
-        return _COLLECTION
+        col = client.get_collection(CHROMA_COLLECTION, embedding_function=embed_fn)
+        return col
+    except Exception:
+        # Not found — list available for better logs
+        with contextlib.suppress(Exception):
+            names = [c.name for c in client.list_collections()]
+            _log(f"⚠️ Collection '{CHROMA_COLLECTION}' not found in {CHROMA_PERSIST_DIR}. "
+                 f"Available: {names}")
+        # Fallback: create to avoid hard-crash, but user will see zero count
+        return client.get_or_create_collection(name=CHROMA_COLLECTION, embedding_function=embed_fn)
 
 
 # =============================================================================
-# 5) Public API — Guideline vector search
+# 7) Public API — Guideline vector search
 # =============================================================================
 
 def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
@@ -303,7 +320,7 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
 
 
 # =============================================================================
-# 6) Public API — Structured drug lookup (SQLite)
+# 8) Public API — Structured drug lookup (SQLite)
 # =============================================================================
 
 def _connect_sqlite(path: str) -> Optional[sqlite3.Connection]:
@@ -334,24 +351,24 @@ def _sqlite_search_drugfacts(name_substr: str, topn: int = 5) -> List[Dict[str, 
         cur.execute(
             "SELECT name, indications, contraindications, interactions, pregnancy, source "
             "FROM drugs WHERE name LIKE ? ORDER BY name LIMIT ?",
-            (f"%{key}%", int(topn)),
+            (f\"%{key}%\", int(topn)),
         )
         rows = cur.fetchall()
         out: List[Dict[str, Any]] = []
         for r in rows:
             name, indications, contraindications, interactions, pregnancy, source = r
-            text = "\n".join([
-                str(name or ""),
-                f"适应症: {indications or ''}",
-                f"禁忌: {contraindications or ''}",
-                f"相互作用: {interactions or ''}",
-                f"妊娠分级: {pregnancy or ''}",
+            text = \"\\n\".join([
+                str(name or \"\"),
+                f\"适应症: {indications or ''}\",
+                f\"禁忌: {contraindications or ''}\",
+                f\"相互作用: {interactions or ''}\",
+                f\"妊娠分级: {pregnancy or ''}\",
             ]).strip()
             out.append({
-                "id": f"sqlite:{name}",
-                "content": text,
-                "meta": {"title": name, "source": source or "sqlite", "type": "drug"},
-                "score": 0.50,  # neutral-ish; will be fused by RRF if needed
+                \"id\": f\"sqlite:{name}\",
+                \"content\": text,
+                \"meta\": {\"title\": name, \"source\": source or \"sqlite\", \"type\": \"drug\"},
+                \"score\": 0.50,  # neutral-ish; will be fused by RRF if needed
             })
         return out
     finally:
@@ -373,18 +390,18 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         cur = con.cursor()
-        cur.execute("SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{key}%",))
+        cur.execute(\"SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1\", (f\"%{key}%\",))
         row = cur.fetchone()
         if not row:
             return None
-        return {"name": row["name"] if "name" in row.keys() else key, "row": dict(row)}
+        return {\"name\": row[\"name\"] if \"name\" in row.keys() else key, \"row\": dict(row)}
     finally:
         with contextlib.suppress(Exception):
             con.close()
 
 
 # =============================================================================
-# 7) Hybrid search (RRF fusion) — optional, for future use
+# 9) Hybrid search (RRF fusion) — optional, for future use
 # =============================================================================
 
 def _rrf(lists: List[List[Dict[str, Any]]], k: int, k_rrf: float = 60.0) -> List[Dict[str, Any]]:
@@ -397,14 +414,14 @@ def _rrf(lists: List[List[Dict[str, Any]]], k: int, k_rrf: float = 60.0) -> List
     score = defaultdict(float)
     for lst in lists:
         for rank, item in enumerate(lst):
-            _id = str(item.get("id") or f"@{id(item)}")
+            _id = str(item.get(\"id\") or f\"@{id(item)}\")
             bucket[_id] = item
             score[_id] += 1.0 / (k_rrf + rank + 1)
     ranked = sorted(bucket.items(), key=lambda kv: score[kv[0]], reverse=True)
     out: List[Dict[str, Any]] = []
     for _id, it in ranked[:max(1, int(k))]:
         it = dict(it)
-        it["rrf"] = score[_id]
+        it[\"rrf\"] = score[_id]
         out.append(it)
     return out
 
@@ -421,22 +438,8 @@ def hybrid_search(query: str, k: int = 8, use_sqlite: bool = True) -> List[Dict[
 
 
 # =============================================================================
-# 8) CLI smoke test
+# 10) Diagnostics helpers (called from app.py)
 # =============================================================================
-
-def _pretty(hits: List[Dict[str, Any]]) -> None:
-    for i, h in enumerate(hits, 1):
-        m = h.get("meta") or {}
-        title = m.get("title") or m.get("section") or ""
-        src   = m.get("source") or ""
-        typ   = m.get("type") or ""
-        line1 = (h.get("content") or "").strip().replace("\n", " ")
-        print(f"{i:>2}. score={h.get('score',0):.3f} rrf={h.get('rrf',0):.4f} | {title} [{typ}] | {src}")
-        if line1:
-            print("    ", (line1[:160] + "…") if len(line1) > 160 else line1)
-
-# ---- Diagnostics helpers (called from app.py) ----
-from typing import Any, Dict, List
 
 def list_collections_safe(max_items: int = 100) -> List[Dict[str, Any]]:
     """
@@ -462,6 +465,36 @@ def list_collections_safe(max_items: int = 100) -> List[Dict[str, Any]]:
     except Exception as e:
         _log("list_collections_safe error:", repr(e))
         return []
+
+def primary_collection_count() -> int:
+    """
+    Return number of items (chunks) in the active collection.
+    - If the collection does not exist yet, returns 0 (and app can show a
+      helpful message telling user to run ingestion).
+    - If counting fails for any reason, returns -1.
+    """
+    try:
+        col = get_chroma_collection()
+        return int(col.count())
+    except Exception as e:
+        _log("primary_collection_count error:", repr(e))
+        return -1
+
+
+# =============================================================================
+# 11) CLI smoke test
+# =============================================================================
+
+def _pretty(hits: List[Dict[str, Any]]) -> None:
+    for i, h in enumerate(hits, 1):
+        m = h.get("meta") or {}
+        title = m.get("title") or m.get("section") or ""
+        src   = m.get("source") or ""
+        typ   = m.get("type") or ""
+        line1 = (h.get("content") or "").strip().replace("\n", " ")
+        print(f"{i:>2}. score={h.get('score',0):.3f} rrf={h.get('rrf',0):.4f} | {title} [{typ}] | {src}")
+        if line1:
+            print("    ", (line1[:160] + "…") if len(line1) > 160 else line1)
 
 def main():
     import argparse

@@ -509,6 +509,13 @@ def render_diagnostics(lang: str = "zh") -> None:
         except Exception as e:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
+        # show active collection count (chunks)
+        try:
+            count = R.primary_collection_count()
+            st.markdown(f"**Chunks in active collection (`{os.getenv('CHROMA_COLLECTION')}`)**: `{count}`")
+        except Exception as e:
+            st.markdown(f"**Chunks in active collection**: `-`")
+
         # SQLite 存在性与表
         db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
         abs_db = os.path.abspath(db_path)
