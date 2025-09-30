@@ -7,16 +7,17 @@ CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 - 通过 rag.pipeline.answer 提供建议文本（反射式调用，兼容是否含 lang 参数）
 - 证据片段/药品结构化/运行日志 Tab
 - ✅ 诊断面板：展示有效配置（Secrets 优先）、chroma_store 是否存在、
-  Chroma 集合与条目数（调用 retriever.list_collections_safe 防止 `_type` 报错）、
-  SQLite 文件是否存在与表清单
-- ✅ 新增：本会话历史记录与“一键复用”
-- 不显示 Python 版本信息
+  Chroma 集合与条目数（调用 retriever.list_collections_safe / primary_collection_count，
+  避免额外创建第二个 Chroma 客户端）
+- ✅ 本会话历史记录与“一键复用”
+- 保留 Python/sqlite/Torch/Chroma 版本信息显示（不构造额外 Chroma 客户端）
 """
 
 from __future__ import annotations
 
 import os
 import re
+import sys
 import json
 import time
 import inspect
@@ -24,29 +25,23 @@ from typing import Any, Dict, List, Optional
 import importlib
 
 import streamlit as st
-# Import retriever first so it can install its SQLite shim if the stdlib is too old
-from rag import retriever as R  # noqa: F401    # 仅为 shim
+# 先导入 retriever：其内部会根据需要安装 SQLite shim（老版本 SQLite 的云端有用）
+from rag import retriever as R  # noqa: F401   # 用于 shim 与缓存化的 Chroma 客户端
 import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
 import sqlite3
-     
+
 
 # =============================================================================
-# 0) 辅助函数 / Helpers
+# 0) 侧边栏：环境诊断（版本/路径/集合计数）
+#    小心：不要在这里直接实例化另一个 chromadb.PersistentClient，
+#    统一走 retriever 的单例客户端，以避免“different settings”报错。
 # -----------------------------------------------------------------------------
-
-try:
-    import pysqlite3  # noqa: F401
-    import sys
-    sys.modules["sqlite3"] = __import__("pysqlite3")
-except Exception:
-    pass
-
-
 with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
     st.write("**Python version**:", sys.version)
-    st.write("**sqlite3 module version**:", sqlite3.version)    # Python wrapper version
-    st.write("**sqlite3 library version**:", sqlite3.sqlite_version)    # Underlying lib version
+    st.write("**sqlite3 module version**:", sqlite3.version)          # Python wrapper version
+    st.write("**sqlite3 library version**:", sqlite3.sqlite_version)  # Underlying lib version
 
+    # 版本信息不依赖客户端；纯 import 安全
     try:
         import torch
         st.write("**Torch version**:", torch.__version__)
@@ -64,18 +59,22 @@ with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
     st.write("**CHROMA_PERSIST_DIR**:", persist)
     st.write("**CHROMA_COLLECTION (from env)**:", coll)
 
+    # ✅ 使用 retriever 的单例客户端做统计，避免创建第二个客户端
     try:
-        client = chromadb.PersistentClient(path=persist)
-        col = client.get_collection(coll)
-        st.write("**Collection count**:", col.count())
+        count = R.primary_collection_count()
+        st.write("**Collection count (active)**:", count)
+        # 如需列出集合，用 list_collections_safe（不会抛异常）
+        cols = R.list_collections_safe()
+        if cols:
+            st.write("**Collections (name → count)**:",
+                     {c.get("name", ""): c.get("count", -1) for c in cols})
     except Exception as e:
-        st.error(f"❌ Failed to open collection: {e}")
+        st.error(f"❌ Failed to query collections via retriever: {e}")
 
 
-# ---------------------------
-# 小工具
-# ---------------------------
-#(在顶部（所有 chromadb/sqlite3 被导入之前）加入 sqlite shim)
+# =============================================================================
+# 1) Helper：Secrets 优先的 env 读取 + 友好工具
+# -----------------------------------------------------------------------------
 def _env(key: str, default: str | None = None) -> str | None:
     """
     Secrets-aware env reader:
@@ -87,23 +86,22 @@ def _env(key: str, default: str | None = None) -> str | None:
         return os.getenv(key, default)
 
 def link_citations(md: str) -> str:
-    """
-    将 "[#3]" 或 "[3]" 转为页面锚点 "#hit-3"，便于从建议跳回证据片段。
-    """
+    """把 "[#3]" / "[3]" 转为 "#hit-3" 锚点链接，便于从建议跳回证据片段。"""
     return re.sub(r"\[(?:#)?(\d+)\]", r"[\1](#hit-\1)", md or "")
 
 def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
-    """
-    将证据片段渲染为 Markdown（用于下载）。
-    """
+    """将证据片段渲染为 Markdown（用于下载）。"""
     lines = []
     for i, h in enumerate(hits or [], 1):
         m = h.get("meta") or {}
         title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
         source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
         year   = str(m.get("year")   or "—")
-        head = f"### #{i} {title}\n\n" + (f"- 来源：{source} · 年份：{year}\n\n" if lang=="zh"
-                                          else f"- Source: {source} · Year: {year}\n\n")
+        head = (
+            f"### #{i} {title}\n\n"
+            + (f"- 来源：{source} · 年份：{year}\n\n" if lang == "zh"
+               else f"- Source: {source} · Year: {year}\n\n")
+        )
         lines.append(head + (h.get("content") or "") + "\n")
     return "\n".join(lines)
 
@@ -128,7 +126,7 @@ def friendly_hints(lang: str, exc: Exception) -> List[str]:
 
 
 # =============================================================================
-# 1) 极简 i18n（页面文案；pipeline 内部生成的文本已在后端本地化）
+# 2) 极简 i18n（页面文案；pipeline 内部生成的文本已在后端本地化）
 # -----------------------------------------------------------------------------
 I18N: Dict[str, Dict[str, str]] = {
     "zh": {
@@ -239,7 +237,7 @@ def t(lang: str, key: str) -> str:
 
 
 # =============================================================================
-# 2) 页面配置 & 轻量样式
+# 3) 轻量样式
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="CareMind · MVP CDSS", layout="wide", page_icon="💊")
 st.markdown("""
@@ -255,7 +253,7 @@ footer{visibility:hidden;}
 
 
 # =============================================================================
-# 3) 侧边栏
+# 4) 侧边栏（设置/过滤/预设/历史）
 # -----------------------------------------------------------------------------
 with st.sidebar:
     lang = st.selectbox("Language / 语言", options=["zh", "en"], index=0,
@@ -282,7 +280,7 @@ with st.sidebar:
         "en": {
             t("en","preset1"): "For CKD on ACEI/ARB, what to monitor and how often?",
             t("en","preset2"): "Elderly with T2DM+CAD: target BP and first-line therapy?",
-            t("en","preset3"): "GDM: when to start insulin and starting dose?",
+            t("en","preset3"): "GDM: when to start insulin",
         }
     }
     preset_none = t(lang, "preset_none")
@@ -301,8 +299,9 @@ with st.sidebar:
             if st.button(t(lang, "reuse"), key=f"reuse_side_{idx}"):
                 st.session_state["prefill"] = h
 
+
 # =============================================================================
-# 4) 输入区
+# 5) 输入表单
 # -----------------------------------------------------------------------------
 st.title(t(lang, "title"))
 with st.form("cm_query"):
@@ -320,7 +319,7 @@ with st.form("cm_query"):
 
 
 # =============================================================================
-# 5) 结果页签
+# 6) 页签：建议 / 证据片段 / 药品结构化 / 运行日志
 # -----------------------------------------------------------------------------
 tab_adv, tab_hits, tab_drug, tab_log = st.tabs([
     t(lang, "tab_advice"),
@@ -334,7 +333,7 @@ elapsed: Optional[float] = None
 
 
 # =============================================================================
-# 6) 调用后端（反射式，兼容是否含 lang 参数）
+# 7) 调用后端（反射式，兼容是否含 lang 参数）
 # -----------------------------------------------------------------------------
 if submitted:
     if not (q and q.strip()):
@@ -368,7 +367,7 @@ if submitted:
 
 
 # =============================================================================
-# 7) 渲染结果
+# 8) 渲染结果
 # -----------------------------------------------------------------------------
 if res:
     # --- 建议 ---
@@ -385,21 +384,21 @@ if res:
         b1, b2, _spacer = st.columns([1, 1, 4])
         with b1:
             st.download_button(
-            t(lang, "export_advice"),
-            data=(output_text or "").encode("utf-8"),
-            file_name="caremind_advice.md",
-            mime="text/markdown",
-            use_container_width=True,
+                t(lang, "export_advice"),
+                data=(output_text or "").encode("utf-8"),
+                file_name="caremind_advice.md",
+                mime="text/markdown",
+                use_container_width=True,
                 disabled=not bool((output_text or "").strip()),
-        )
+            )
         with b2:
             st.download_button(
-            t(lang, "export_evidence"),
-            data=(ev_md or "").encode("utf-8"),
-            file_name="caremind_evidence.md",
-            mime="text/markdown",
-            use_container_width=True,
-            disabled=not bool((ev_md or "").strip()),
+                t(lang, "export_evidence"),
+                data=(ev_md or "").encode("utf-8"),
+                file_name="caremind_evidence.md",
+                mime="text/markdown",
+                use_container_width=True,
+                disabled=not bool((ev_md or "").strip()),
             )
         st.caption(t(lang, "disclaimer"))
 
@@ -439,7 +438,7 @@ if res:
                 doc_id = str(m.get("id")     or "—")
                 label = f"#{i} · {title[:60]}"
                 st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
-                with st.expander(label, expanded=bool(expand_hits)):
+                with st.expander(label, expanded=False):
                     if show_meta:
                         st.markdown(
                             f"<div class='cm-muted'>"
@@ -481,7 +480,7 @@ if res:
 
 
 # =============================================================================
-# 8) 诊断面板（始终可见；使用 retriever.list_collections_safe）
+# 9) 诊断面板（始终可见；统一使用 retriever 的安全接口）
 # -----------------------------------------------------------------------------
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
@@ -492,7 +491,7 @@ def render_diagnostics(lang: str = "zh") -> None:
         eff = {k: _env(k, None) for k in keys}
         st.write(t(lang, "diag_cfg"))
         st.code(json.dumps(eff, ensure_ascii=False, indent=2))
-        # ✅ 显示 retriever 版本号，确认云端是否更新到位
+        # retriever 版本号（确认云端是否更新到位）
         st.write("Retriever version:", getattr(R, "VERSION", "unknown"))
 
         # Chroma 目录存在性
@@ -501,7 +500,7 @@ def render_diagnostics(lang: str = "zh") -> None:
         st.write(f"{'Chroma 目录存在：' if lang=='zh' else 'Chroma dir exists:'} "
                  f"{abs_chroma} → {os.path.exists(abs_chroma)}")
 
-        # 集合与条数（安全方式；避免 _type）
+        # 集合列表（安全方式）与活动集合块数
         try:
             cols = R.list_collections_safe()
             st.write(t(lang, "diag_chroma"))
@@ -509,12 +508,11 @@ def render_diagnostics(lang: str = "zh") -> None:
         except Exception as e:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
-        # show active collection count (chunks)
         try:
             count = R.primary_collection_count()
             st.markdown(f"**Chunks in active collection (`{os.getenv('CHROMA_COLLECTION')}`)**: `{count}`")
-        except Exception as e:
-            st.markdown(f"**Chunks in active collection**: `-`")
+        except Exception:
+            st.markdown("**Chunks in active collection**: `-`")
 
         # SQLite 存在性与表
         db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
@@ -522,7 +520,6 @@ def render_diagnostics(lang: str = "zh") -> None:
         st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
                  f"{abs_db} → {os.path.exists(abs_db)}")
         try:
-            import sqlite3
             con = sqlite3.connect(abs_db)
             cur = con.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -538,6 +535,6 @@ render_diagnostics(lang)
 
 
 # =============================================================================
-# 9) 页脚
+# 10) 页脚
 # -----------------------------------------------------------------------------
 st.caption(t(lang, "page_footer"))

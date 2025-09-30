@@ -1,86 +1,108 @@
 # -*- coding: utf-8 -*-
 """
-CareMind · RAG Retriever (richly commented, future-proof)
+CareMind · RAG Retriever
+========================
 
-This consolidates the best parts of your previous retriever while fixing the
-partial-merge/indentation issues that broke `streamlit run`.
+This module centralizes *all* data-access concerns for CareMind's MVP:
+- Vector search over guideline chunks using ChromaDB + SentenceTransformers.
+- Optional structured lookup from a small SQLite drug DB.
+- Robust environment / platform compatibility (Streamlit Cloud friendly).
+- Single, cached Chroma client and collection to avoid settings conflicts.
+- Diagnostics helpers that your Streamlit UI can surface directly.
 
-Design goals
-------------
-1) Be **import-safe** in Streamlit Cloud and local dev:
-   - Provide a SQLite compatibility shim (uses stdlib if >=3.35.0, otherwise
-     aliases `pysqlite3` to `sqlite3`).
-   - Lazy-import Chroma so that missing/old system libs won’t crash the module
-     import (errors appear only when the functions are executed).
-2) Keep **one** Chroma client and **one** collection cache to avoid duplicate
-   stacks and race conditions across hot-reloads. (Uses st.cache_resource when
-   available to prevent “An instance of Chroma already exists …with different
-   settings”.)
-3) Pre-migrate Chroma sysdb (`collections.configuration`) to insert a minimal
-   JSON with `_type` when missing — this unblocks older Chroma stores.
-4) Provide **stable public API** that `rag/pipeline.py` already calls:
-      - search_guidelines(question: str, k: int=4) -> List[dict]
-      - search_drug_structured(drug_name: str) -> Optional[dict]
-   …and keep extra helpers you will likely need soon:
-      - hybrid_search(query, k=8, use_sqlite=True) with RRF fusion
-      - _sqlite_search_drugfacts(name_substr, topn=5) -> List[dict]
-5) Rich logs to diagnose Cloud issues quickly and a `primary_collection_count()`
-   helper so Streamlit can show “chunks available”.
+Why this file is long and richly commented
+------------------------------------------
+The intent is to leave you with a *self-documenting* reference that a future
+collaborator can read without needing our chat context. Each section begins
+with a short rationale and gives practical tips for debugging.
 
-Environment variables
----------------------
-CHROMA_PERSIST_DIR  : default "./chroma_store"
-CHROMA_COLLECTION   : default "guideline_chunks"
-EMBEDDING_MODEL     : default "BAAI/bge-large-zh-v1.5"
-DRUG_DB_PATH        : default "./db/drugs.sqlite"
-CHROMA_TELEMETRY_OFF: default "1" (turn off anonymized telemetry)
+Design principles
+-----------------
+1) **Single source of truth** for Chroma access
+   Hot-reloads on Streamlit can easily create multiple Chroma clients with
+   slightly different Settings (e.g., telemetry flags). We use a cached
+   factory to create *one* client per process and keep Settings identical.
 
-CLI
----
+2) **Absolute paths & consistent Settings everywhere**
+   Relative paths change when the working directory changes; absolute paths
+   prevent “same directory, different identity” surprises. All Chroma Settings
+   are set in exactly one place to avoid “different settings” conflicts.
+
+3) **Backwards-compatibility**
+   Managed hosts sometimes ship an older SQLite. We shim to `pysqlite3` when
+   needed. We also apply a tiny pre-migration for Chroma sysdb
+   (`collections.configuration`) if `_type` is missing.
+
+4) **Return safe values**
+   User-facing API (`search_guidelines`, etc.) never throws; it returns `[]`
+   or `None` and logs a concise hint.
+
+5) **Diagnose fast**
+   The module prints short, timestamped messages; the UI can call
+   `list_collections_safe()` and `primary_collection_count()` to show live
+   health signals (“how many chunks do we actually have?”).
+
+Environment variables (with sensible defaults)
+----------------------------------------------
+- CHROMA_PERSIST_DIR : "./chroma_store"
+- CHROMA_COLLECTION  : "guideline_chunks"  (you set to "guideline_chunks_v2")
+- EMBEDDING_MODEL    : "BAAI/bge-large-zh-v1.5"
+- DRUG_DB_PATH       : "./db/drugs.sqlite"
+- CHROMA_TELEMETRY_OFF : "1" disables anonymized telemetry (default)
+
+Quick smoke tests (CLI)
+-----------------------
 $ python -m rag.retriever --q "哮喘 β受体阻滞剂" --topn 6
-$ python rag/retriever.py --q "aspirin" --method sqlite
+$ python rag/retriever.py --q "阿司匹林" --method sqlite
 """
+
 from __future__ import annotations
 
 import os
 import sys
 import json
+import glob
 import contextlib
 from typing import Any, Dict, List, Optional, Tuple
 
 # =============================================================================
-# 0) Environment & logging
+# 0) Lightweight logging + path helpers
 # =============================================================================
 
-# Disable Chroma telemetry by default (good for Cloud)
-os.environ.setdefault("CHROMA_TELEMETRY_ENABLED", "false")
-os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "false")
-
-CHROMA_TELEMETRY_OFF = os.getenv("CHROMA_TELEMETRY_OFF", "1") not in ("0", "false", "False")
-
-# Use absolute path to avoid ambiguity across working dirs / reloads
-def _abs(p: str) -> str:
-    return os.path.abspath(os.path.expanduser(p))
-
-CHROMA_PERSIST_DIR = _abs(os.getenv("CHROMA_PERSIST_DIR", "./chroma_store"))
-CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION",  "guideline_chunks")
-EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL",    "BAAI/bge-large-zh-v1.5")
-DRUG_DB_PATH       = _abs(os.getenv("DRUG_DB_PATH",  "./db/drugs.sqlite"))
-
-VERSION = "retriever-2025-09-30"
-
 def _log(*msg: Any) -> None:
-    """Single place for retriever logs (helps when debugging Cloud deploys)."""
+    """Single place for retriever logs with timestamps (works in Cloud/stdout)."""
     from datetime import datetime
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] retriever:", *msg, flush=True)
 
+def _abs(p: str) -> str:
+    """Expand ~ and make path absolute to avoid CWD/hot-reload ambiguity."""
+    return os.path.abspath(os.path.expanduser(p))
+
 
 # =============================================================================
-# 1) SQLite compatibility shim (Cloud-friendly)
+# 1) Effective configuration (read env once; use absolute paths)
 # =============================================================================
-# Many managed environments ship an old libsqlite3 (<3.35.0) which breaks Chroma.
-# Strategy: try stdlib sqlite3; if version too old or missing, alias pysqlite3.
+
+# Disable Chroma telemetry by default to keep Settings consistent and quiet.
+os.environ.setdefault("CHROMA_TELEMETRY_ENABLED", "false")
+os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "false")
+CHROMA_TELEMETRY_OFF = os.getenv("CHROMA_TELEMETRY_OFF", "1") not in ("0", "false", "False")
+
+CHROMA_PERSIST_DIR = _abs(os.getenv("CHROMA_PERSIST_DIR", "./chroma_store"))
+CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
+EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+DRUG_DB_PATH       = _abs(os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite"))
+
+VERSION = "retriever-2025-09-30"
+
+
+# =============================================================================
+# 2) SQLite compatibility shim (Streamlit Cloud friendly)
+# =============================================================================
+# Chroma (and sometimes your own SQLite helpers) require SQLite ≥ 3.35.0 for
+# certain features (e.g., RETURNING). Many hosted envs ship older SQLite in
+# the Python stdlib. We alias `pysqlite3` as `sqlite3` when needed.
 
 def _ensure_sqlite() -> None:
     MIN = (3, 35, 0)
@@ -91,12 +113,11 @@ def _ensure_sqlite() -> None:
         except Exception:
             ver_tuple = (0, 0, 0)
         if ver_tuple >= MIN:
-            return
-        # Too old → prefer pysqlite3 (Wheel works on Cloud)
+            return  # stdlib is new enough
+        # Too old → alias pysqlite3
         import pysqlite3 as _py  # type: ignore
         sys.modules["sqlite3"] = _py
     except Exception:
-        # stdlib missing or unusable → last resort
         try:
             import pysqlite3 as _py  # type: ignore
             sys.modules["sqlite3"] = _py
@@ -107,16 +128,19 @@ def _ensure_sqlite() -> None:
             ) from e
 
 _ensure_sqlite()
-import sqlite3  # type: ignore  # noqa: E402
+import sqlite3  # noqa: E402
 
 
 # =============================================================================
-# 2) Lazy embedder (SentenceTransformers) and Chroma loader
+# 3) Lazy embedding + Chroma import (we avoid heavy imports on module import)
 # =============================================================================
-# We avoid importing heavy libs at module import time.
 
 class _LazyEmbedder:
-    """Load the embedding model on the first call."""
+    """
+    Thin wrapper that loads a SentenceTransformer model on first call.
+    We normalize embeddings so cosine ~ dot similarity; this matches common
+    retrieval practice for BGE-family models.
+    """
     def __init__(self, model_name: str):
         self.model_name = model_name
         self._model = None
@@ -131,7 +155,7 @@ class _LazyEmbedder:
         return vecs.tolist()
 
 class _ChromaEmbedFn:
-    """Adapter matching Chroma's embedding_function signature."""
+    """Adapter so our embedder can be passed as `embedding_function` into Chroma."""
     def __init__(self, embedder: _LazyEmbedder):
         self._embedder = embedder
     def __call__(self, inputs: List[str]) -> List[List[float]]:
@@ -139,41 +163,37 @@ class _ChromaEmbedFn:
 
 _EMBED = _LazyEmbedder(EMBEDDING_MODEL)
 
-# =============================================================================
-# 3) Streamlit-friendly caching primitives (one client per process)
-# =============================================================================
-try:
-    import streamlit as st
-    cache_resource = st.cache_resource
-except Exception:
-    def cache_resource(func):  # no-op fallback
-        return func
-
-# =============================================================================
-# 4) Lazy import Chroma
-# =============================================================================
-
 def _chroma_import():
-    """Import Chroma on demand."""
+    """Import Chroma on demand; gives a clear error if it isn’t available."""
     try:
         from chromadb import PersistentClient, Settings  # type: ignore
         return PersistentClient, Settings
     except Exception as e:
         raise RuntimeError(
-            "Failed to import `chromadb`. Install it and ensure SQLite is usable.\n"
-            "Tip: add `pysqlite3-binary` to requirements on Streamlit Cloud."
+            "Failed to import `chromadb`. Install it and ensure SQLite works.\n"
+            "Tip (Cloud): include `pysqlite3-binary` in requirements."
         ) from e
 
 
 # =============================================================================
-# 5) Chroma sysdb pre-migration (fix missing configuration._type)
+# 4) Streamlit-aware caching (ensure a single client/collection per process)
+# =============================================================================
+
+try:
+    import streamlit as st
+    cache_resource = st.cache_resource  # persists across reruns in one process
+except Exception:
+    def cache_resource(func):  # no-op fallback for non-Streamlit contexts
+        return func
+
+
+# =============================================================================
+# 5) Chroma sysdb pre-migration (fix older stores missing configuration._type)
 # =============================================================================
 
 def _sysdb_paths(persist_dir: str) -> List[str]:
-    """Return likely sysdb sqlite file paths inside `persist_dir`."""
-    import glob
     pats = [
-        os.path.join(persist_dir, "chroma-*.db"),   # modern
+        os.path.join(persist_dir, "chroma-*.db"),   # modern layout
         os.path.join(persist_dir, "chroma.sqlite"), # older
         os.path.join(persist_dir, "chroma.db"),     # very old
     ]
@@ -221,32 +241,32 @@ def _premigrate_sysdb(persist_dir: str) -> int:
         finally:
             with contextlib.suppress(Exception):
                 con.close()
-    return total  # <-- fixed (was a typo `tota`)
+    return total  # (typo guard: never return a misspelled variable)
 
 
 # =============================================================================
-# 6) Client / collection getters (single, cached, consistent Settings)
+# 6) Client/collection factories — *single cached instances*
 # =============================================================================
 
 @cache_resource
-def get_chroma_client():
+def get_chroma_client(persist_dir: Optional[str] = None):
     """
-    Create (once) and return a PersistentClient, after a best-effort premigrate.
+    Create (once) and return a PersistentClient, after a best-effort pre-migration.
     Using st.cache_resource guarantees a single instance per Streamlit process,
     preventing 'An instance of Chroma already exists …with different settings'.
     """
-    os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
-    # best-effort migration before touching Chroma
+    pdir = _abs(persist_dir or CHROMA_PERSIST_DIR)
+    os.makedirs(pdir, exist_ok=True)
     try:
-        changed = _premigrate_sysdb(CHROMA_PERSIST_DIR)
+        changed = _premigrate_sysdb(pdir)
         if changed:
             _log(f"Premigrated collections: {changed}")
     except Exception as e:
         _log("Premigrate skipped due to error:", repr(e))
     PersistentClient, Settings = _chroma_import()
-    # IMPORTANT: keep Settings EXACTLY the same everywhere
+    # IMPORTANT: keep Settings EXACTLY the same everywhere across the project.
     return PersistentClient(
-        path=CHROMA_PERSIST_DIR,
+        path=pdir,
         settings=Settings(
             anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
             allow_reset=False,
@@ -254,39 +274,45 @@ def get_chroma_client():
     )
 
 @cache_resource
-def get_chroma_collection():
+def get_chroma_collection(name: Optional[str] = None, embed_model: Optional[str] = None):
     """
-    Open and cache the primary collection.
-    We try to *get* first (don’t silently create a fresh, empty one),
-    so that diagnostics reflect a genuinely missing collection.
+    Open and cache the primary collection. We try `get_collection()` first
+    (don’t silently create a brand new empty one), and if missing, we print
+    the available names to guide debugging, then optionally create an empty
+    collection so the app doesn’t crash.
     """
     client = get_chroma_client()
-    embed_fn = _ChromaEmbedFn(_EMBED)
-    # Try to get existing; if missing, log available names to help debugging
+    embed_fn = _ChromaEmbedFn(_EMBED if not embed_model else _LazyEmbedder(embed_model))
+    target = (name or CHROMA_COLLECTION)
     try:
-        col = client.get_collection(CHROMA_COLLECTION, embedding_function=embed_fn)
-        return col
+        return client.get_collection(target, embedding_function=embed_fn)
     except Exception:
-        # Not found — list available for better logs
         with contextlib.suppress(Exception):
             names = [c.name for c in client.list_collections()]
-            _log(f"⚠️ Collection '{CHROMA_COLLECTION}' not found in {CHROMA_PERSIST_DIR}. "
-                 f"Available: {names}")
-        # Fallback: create to avoid hard-crash, but user will see zero count
-        return client.get_or_create_collection(name=CHROMA_COLLECTION, embedding_function=embed_fn)
+            _log(f"⚠️ Collection '{target}' not found in {CHROMA_PERSIST_DIR}. Available: {names}")
+        # Fallback: create (empty) to avoid hard crash — UI can show count=0.
+        return client.get_or_create_collection(target, embedding_function=embed_fn)
 
 
 # =============================================================================
-# 7) Public API — Guideline vector search
+# 7) Public API — Vector search over guideline chunks
 # =============================================================================
 
 def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
     """
     Retrieve Top-k guideline chunks via Chroma.
+
     Returns a list of dicts:
-        { 'id': str, 'content': str, 'meta': dict, 'score': float }
-    where `score` is (1 - distance) so that **higher is better**.
-    Safe: returns [] if query is empty or Chroma is unavailable.
+        {
+          'id': str,
+          'content': str,
+          'meta': dict,
+          'score': float  # 1 - distance (higher is better)
+        }
+
+    Safe behavior:
+    - Empty query → [].
+    - Any error → [] with a concise log (does not raise to the UI).
     """
     q = (query or "").strip()
     if not q:
@@ -320,8 +346,10 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
 
 
 # =============================================================================
-# 8) Public API — Structured drug lookup (SQLite)
+# 8) Optional structured lookup — small SQLite drug database
 # =============================================================================
+# Keep this minimal; you can evolve the schema later. We purposefully keep the
+# code defensive: missing DB → None/[] without exceptions.
 
 def _connect_sqlite(path: str) -> Optional[sqlite3.Connection]:
     if not path or not os.path.exists(path):
@@ -336,8 +364,8 @@ def _connect_sqlite(path: str) -> Optional[sqlite3.Connection]:
 
 def _sqlite_search_drugfacts(name_substr: str, topn: int = 5) -> List[Dict[str, Any]]:
     """
-    Return lightweight text snippets from a simple `drugs` table. You can adapt
-    the SQL/columns to your actual schema later.
+    Return lightweight text snippets from a simple `drugs` table. Adapt the
+    SQL to your actual schema when needed.
     """
     key = (name_substr or "").strip()
     if not key:
@@ -347,28 +375,27 @@ def _sqlite_search_drugfacts(name_substr: str, topn: int = 5) -> List[Dict[str, 
         return []
     try:
         cur = con.cursor()
-        # Adjust the table/columns below to match your schema
         cur.execute(
             "SELECT name, indications, contraindications, interactions, pregnancy, source "
             "FROM drugs WHERE name LIKE ? ORDER BY name LIMIT ?",
-            (f\"%{key}%\", int(topn)),
+            (f"%{key}%", int(topn)),
         )
         rows = cur.fetchall()
         out: List[Dict[str, Any]] = []
         for r in rows:
             name, indications, contraindications, interactions, pregnancy, source = r
-            text = \"\\n\".join([
-                str(name or \"\"),
-                f\"适应症: {indications or ''}\",
-                f\"禁忌: {contraindications or ''}\",
-                f\"相互作用: {interactions or ''}\",
-                f\"妊娠分级: {pregnancy or ''}\",
+            text = "\n".join([
+                str(name or ""),
+                f"适应症: {indications or ''}",
+                f"禁忌: {contraindications or ''}",
+                f"相互作用: {interactions or ''}",
+                f"妊娠分级: {pregnancy or ''}",
             ]).strip()
             out.append({
-                \"id\": f\"sqlite:{name}\",
-                \"content\": text,
-                \"meta\": {\"title\": name, \"source\": source or \"sqlite\", \"type\": \"drug\"},
-                \"score\": 0.50,  # neutral-ish; will be fused by RRF if needed
+                "id": f"sqlite:{name}",
+                "content": text,
+                "meta": {"title": name, "source": source or "sqlite", "type": "drug"},
+                "score": 0.50,  # neutral-ish; if you fuse results later, this plays well
             })
         return out
     finally:
@@ -377,10 +404,8 @@ def _sqlite_search_drugfacts(name_substr: str, topn: int = 5) -> List[Dict[str, 
 
 def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
     """
-    Very small helper used by pipeline.py.
-    Returns a single best-effort dict:
-        { 'name': str, 'row': dict }  OR  None
-    If your schema is different, update `_sqlite_search_drugfacts` accordingly.
+    A small helper used by pipeline.py. Returns one best row (or None):
+        { 'name': str, 'row': dict }
     """
     key = (drug_name or "").strip()
     if not key:
@@ -390,46 +415,39 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         cur = con.cursor()
-        cur.execute(\"SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1\", (f\"%{key}%\",))
+        cur.execute("SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{key}%",))
         row = cur.fetchone()
         if not row:
             return None
-        return {\"name\": row[\"name\"] if \"name\" in row.keys() else key, \"row\": dict(row)}
+        return {"name": row["name"] if "name" in row.keys() else key, "row": dict(row)}
     finally:
         with contextlib.suppress(Exception):
             con.close()
 
 
 # =============================================================================
-# 9) Hybrid search (RRF fusion) — optional, for future use
+# 9) Simple hybrid (RRF) — optional helper for demos / future fusion
 # =============================================================================
-
 def _rrf(lists: List[List[Dict[str, Any]]], k: int, k_rrf: float = 60.0) -> List[Dict[str, Any]]:
-    """
-    Reciprocal Rank Fusion across multiple result lists.
-    Each item must have a stable id (we synthesize one if missing).
-    """
+    """Reciprocal Rank Fusion across multiple ranked lists."""
     from collections import defaultdict
     bucket: Dict[str, Dict[str, Any]] = {}
     score = defaultdict(float)
     for lst in lists:
         for rank, item in enumerate(lst):
-            _id = str(item.get(\"id\") or f\"@{id(item)}\")
+            _id = str(item.get("id") or f"@{id(item)}")
             bucket[_id] = item
             score[_id] += 1.0 / (k_rrf + rank + 1)
     ranked = sorted(bucket.items(), key=lambda kv: score[kv[0]], reverse=True)
     out: List[Dict[str, Any]] = []
     for _id, it in ranked[:max(1, int(k))]:
         it = dict(it)
-        it[\"rrf\"] = score[_id]
+        it["rrf"] = score[_id]
         out.append(it)
     return out
 
 def hybrid_search(query: str, k: int = 8, use_sqlite: bool = True) -> List[Dict[str, Any]]:
-    """
-    Combine vector guidelines and (optional) SQLite drugfacts via RRF.
-    Handy for quick demos; not used by pipeline.py today.
-    """
+    """Fuse guideline vector results with optional SQLite snippets."""
     base = search_guidelines(query, k=k)
     lists = [base]
     if use_sqlite:
@@ -438,12 +456,12 @@ def hybrid_search(query: str, k: int = 8, use_sqlite: bool = True) -> List[Dict[
 
 
 # =============================================================================
-# 10) Diagnostics helpers (called from app.py)
+# 10) Diagnostics helpers — Streamlit UI can call these directly
 # =============================================================================
 
 def list_collections_safe(max_items: int = 100) -> List[Dict[str, Any]]:
     """
-    List Chroma collections with basic stats, but never raise on error.
+    List Chroma collections with basic stats, *never* raising an exception.
     Each item: {"name": str, "id": str, "count": int, "metadata": dict}
     """
     try:
@@ -468,10 +486,9 @@ def list_collections_safe(max_items: int = 100) -> List[Dict[str, Any]]:
 
 def primary_collection_count() -> int:
     """
-    Return number of items (chunks) in the active collection.
-    - If the collection does not exist yet, returns 0 (and app can show a
-      helpful message telling user to run ingestion).
-    - If counting fails for any reason, returns -1.
+    Return the number of items (chunks) in the active collection.
+    0  → collection exists but is empty or just created.
+    -1 → a counting error occurred (the UI can render this as a warning).
     """
     try:
         col = get_chroma_collection()
@@ -492,7 +509,7 @@ def _pretty(hits: List[Dict[str, Any]]) -> None:
         src   = m.get("source") or ""
         typ   = m.get("type") or ""
         line1 = (h.get("content") or "").strip().replace("\n", " ")
-        print(f"{i:>2}. score={h.get('score',0):.3f} rrf={h.get('rrf',0):.4f} | {title} [{typ}] | {src}")
+        print(f"{i:>2}. score={h.get('score',0):.3f} | {title} [{typ}] | {src}")
         if line1:
             print("    ", (line1[:160] + "…") if len(line1) > 160 else line1)
 
