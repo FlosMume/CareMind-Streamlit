@@ -332,7 +332,7 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
         res = col.query(
             query_texts=[q],
             n_results=max(1, int(k)),
-            include=["documents", "metadatas", "distances", "ids"],
+            include=["documents", "metadatas", "distances"],
         )
         ids   = (res.get("ids") or [[]])[0]
         docs  = (res.get("documents") or [[]])[0]
