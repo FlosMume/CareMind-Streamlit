@@ -154,14 +154,38 @@ class _LazyEmbedder:
         vecs = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return vecs.tolist()
 
-class _ChromaEmbedFn:
-    """Adapter so our embedder can be passed as `embedding_function` into Chroma."""
+_EMBED = _LazyEmbedder(EMBEDDING_MODEL)
+
+# --- replace the old adapter with this one ---
+
+try:
+    # Chroma ≥ 0.4.16 exposes a base class you can inherit from
+    from chromadb.utils.embedding_functions import EmbeddingFunction as _ChromaEFBase
+except Exception:
+    # Fallback base to keep typing happy if import fails during cold start
+    class _ChromaEFBase:  # type: ignore
+        def __call__(self, input):  # pragma: no cover
+            raise NotImplementedError
+
+class _ChromaEmbedFn(_ChromaEFBase):  # type: ignore
+    """
+    Adapter that satisfies Chroma's EmbeddingFunction interface.
+
+    IMPORTANT: As of Chroma 0.4.16+, the __call__ signature must be:
+        __call__(self, input: List[str]) -> List[List[float]]
+    (parameter name **input**, not inputs)
+    """
     def __init__(self, embedder: _LazyEmbedder):
         self._embedder = embedder
-    def __call__(self, inputs: List[str]) -> List[List[float]]:
-        return self._embedder(inputs)
 
-_EMBED = _LazyEmbedder(EMBEDDING_MODEL)
+    # Chroma expects the parameter to be named **input**
+    def __call__(self, input):  # type: ignore[override]
+        # Normalize to a list of strings
+        if isinstance(input, str):
+            docs = [input]
+        else:
+            docs = [d if isinstance(d, str) else str(d) for d in (input or [])]
+        return self._embedder(docs)
 
 def _chroma_import():
     """Import Chroma on demand; gives a clear error if it isn’t available."""
