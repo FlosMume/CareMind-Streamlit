@@ -357,10 +357,26 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
             content = docs[i] if i < len(docs) else ""
             meta    = metas[i] if i < len(metas) else {}
             dist    = float(dists[i] if i < len(dists) else 0.0)
+            
+            # 在 search_guidelines() 内，append 之前加入这段
+            raw = metas[i] if i < len(metas) else {}
+
+            # 规范化：把你的字段名映射到通用键位，UI 就能直接显示
+            norm = dict(raw) if isinstance(raw, dict) else {}
+            norm.setdefault("title",   raw.get("doc_title")     or raw.get("section_title"))
+            norm.setdefault("section", raw.get("section_title"))
+            norm.setdefault("source",  raw.get("source")        or raw.get("source_filename"))
+            # year 可能是字符串，转成 int（UI 用起来更舒服，转失败就保留原值）
+            try:
+                if "year" in raw and raw["year"] not in (None, ""):
+                    norm["year"] = int(str(raw["year"]).strip()[:4])
+            except Exception:
+                norm.setdefault("year", raw.get("year"))
+            
             out.append({
                 "id": _id,
                 "content": content,
-                "meta": meta,
+                "meta": norm,   # 👈 用规范化后的 meta, 给每条命中的 meta 增补一层兼容字段
                 "score": 1.0 - dist,
             })
         return out
