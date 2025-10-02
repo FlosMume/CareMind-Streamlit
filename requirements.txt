@@ -1,46 +1,31 @@
-# ---- Web UI ----
-streamlit==1.49.1
-
-# ---- Vector DB ----
-pydantic<3
-numpy<2.0
-
-torch==2.6.0
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Chroma 与其依赖
-chromadb==0.5.5
+# --- Web UI ---
+streamlit==1.49.1
 
-# 用来提供新版本 sqlite3（适配 Python 3.10 在 Streamlit Cloud）
-pysqlite3-binary==0.5.2.post3
-
-# 向量与重排（按需）
-sentence-transformers>=2.7.0
-# cross-encoder 可选：如果你用 CE 重排，就加；否则可注释
-
-# cross-encoder>=0.2.4
-streamlit>=1.37
-pandas
-numpy
-chromadb==0.5.*
-sentence-transformers
-torch
-pydantic>=2
-scikit-learn
-sqlite-utils
-pysqlite3-binary==0.5.4 ; python_version >= "3.13"
-pysqlite3-binary==0.5.3 ; python_version < "3.13"
-chromadb==0.5.23
-
-# PDF/文本处理
-pdfplumber
-tqdm
-
-# OpenAI 客户端 (官方 1.x)
-openai>=1.2.0
-
-# 环境变量管理
+# --- Core ---
+numpy==1.26.4
+pandas==2.2.2
+tqdm==4.66.4
+typing-extensions>=4.9.0
+pydantic>=2.7,<3
+httpx==0.27.0
+requests>=2.31.0
 python-dotenv>=1.0.0
 
-# 已有的其他依赖（例如 RAG pipeline）
-requests
+# --- Vector DB / RAG ---
+chromadb==0.5.23
+sentence-transformers==2.7.0
+transformers==4.43.3
+scikit-learn==1.4.2
+
+# CPU-only PyTorch (no CUDA on Streamlit Cloud)
+torch==2.6.0
+
+# --- SQLite compatibility (only when needed) ---
+# For Python 3.10 on Cloud, use this build; remove if stdlib sqlite3 is sufficient.
+pysqlite3-binary==0.5.2.post3
+
+# --- Documents / PDF ---
+pdfplumber==0.11.4
+sqlite-utils==3.37.1
