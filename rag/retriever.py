@@ -15,7 +15,6 @@ Why this file is long and richly commented
 The intent is to leave you with a *self-documenting* reference that a future
 collaborator can read without needing our chat context. Each section begins
 with a short rationale and gives practical tips for debugging.
->>>>>>> b3ed42d (Make the retriever truly “single-client” & add a chunk counter API.)
 
 Design principles
 -----------------
@@ -155,14 +154,38 @@ class _LazyEmbedder:
         vecs = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return vecs.tolist()
 
-class _ChromaEmbedFn:
-    """Adapter so our embedder can be passed as `embedding_function` into Chroma."""
+_EMBED = _LazyEmbedder(EMBEDDING_MODEL)
+
+# --- replace the old adapter with this one ---
+
+try:
+    # Chroma ≥ 0.4.16 exposes a base class you can inherit from
+    from chromadb.utils.embedding_functions import EmbeddingFunction as _ChromaEFBase
+except Exception:
+    # Fallback base to keep typing happy if import fails during cold start
+    class _ChromaEFBase:  # type: ignore
+        def __call__(self, input):  # pragma: no cover
+            raise NotImplementedError
+
+class _ChromaEmbedFn(_ChromaEFBase):  # type: ignore
+    """
+    Adapter that satisfies Chroma's EmbeddingFunction interface.
+
+    IMPORTANT: As of Chroma 0.4.16+, the __call__ signature must be:
+        __call__(self, input: List[str]) -> List[List[float]]
+    (parameter name **input**, not inputs)
+    """
     def __init__(self, embedder: _LazyEmbedder):
         self._embedder = embedder
-    def __call__(self, inputs: List[str]) -> List[List[float]]:
-        return self._embedder(inputs)
 
-_EMBED = _LazyEmbedder(EMBEDDING_MODEL)
+    # Chroma expects the parameter to be named **input**
+    def __call__(self, input):  # type: ignore[override]
+        # Normalize to a list of strings
+        if isinstance(input, str):
+            docs = [input]
+        else:
+            docs = [d if isinstance(d, str) else str(d) for d in (input or [])]
+        return self._embedder(docs)
 
 def _chroma_import():
     """Import Chroma on demand; gives a clear error if it isn’t available."""
@@ -230,7 +253,7 @@ def _premigrate_sysdb(persist_dir: str) -> int:
             fixed = 0
             for cid, conf in rows:
                 if not _has_type(conf):
-                    payload = json.dumps({"_type":"CollectionConfigurationInternal"}, ensure_ascii=False)
+                    payload = json.dumps({"_type": "CollectionConfigurationInternal"}, ensure_ascii=False)
                     cur.execute("UPDATE collections SET configuration=? WHERE id=?", (payload, cid))
                     fixed += 1
             if fixed:
@@ -242,7 +265,6 @@ def _premigrate_sysdb(persist_dir: str) -> int:
         finally:
             with contextlib.suppress(Exception):
                 con.close()
-
     return total  # (typo guard: never return a misspelled variable)
 
 
@@ -259,7 +281,6 @@ def get_chroma_client(persist_dir: Optional[str] = None):
     """
     pdir = _abs(persist_dir or CHROMA_PERSIST_DIR)
     os.makedirs(pdir, exist_ok=True)
-
     try:
         changed = _premigrate_sysdb(pdir)
         if changed:
@@ -267,7 +288,6 @@ def get_chroma_client(persist_dir: Optional[str] = None):
     except Exception as e:
         _log("Premigrate skipped due to error:", repr(e))
     PersistentClient, Settings = _chroma_import()
-
     # IMPORTANT: keep Settings EXACTLY the same everywhere across the project.
     return PersistentClient(
         path=pdir,
@@ -275,10 +295,7 @@ def get_chroma_client(persist_dir: Optional[str] = None):
             anonymized_telemetry=not CHROMA_TELEMETRY_OFF,
             allow_reset=False,
         ),
-
     )
-    return _CLIENT
-
 
 @cache_resource
 def get_chroma_collection(name: Optional[str] = None, embed_model: Optional[str] = None):
@@ -288,9 +305,6 @@ def get_chroma_collection(name: Optional[str] = None, embed_model: Optional[str]
     the available names to guide debugging, then optionally create an empty
     collection so the app doesn’t crash.
     """
-    global _COLLECTION
-    if _COLLECTION is not None:
-        return _COLLECTION
     client = get_chroma_client()
     embed_fn = _ChromaEmbedFn(_EMBED if not embed_model else _LazyEmbedder(embed_model))
     target = (name or CHROMA_COLLECTION)
@@ -332,7 +346,7 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
         res = col.query(
             query_texts=[q],
             n_results=max(1, int(k)),
-            include=["documents", "metadatas", "distances"],
+            include=["documents", "metadatas", "distances", "ids"],
         )
         ids   = (res.get("ids") or [[]])[0]
         docs  = (res.get("documents") or [[]])[0]
@@ -343,10 +357,26 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
             content = docs[i] if i < len(docs) else ""
             meta    = metas[i] if i < len(metas) else {}
             dist    = float(dists[i] if i < len(dists) else 0.0)
+            
+            # 在 search_guidelines() 内，append 之前加入这段
+            raw = metas[i] if i < len(metas) else {}
+
+            # 规范化：把你的字段名映射到通用键位，UI 就能直接显示
+            norm = dict(raw) if isinstance(raw, dict) else {}
+            norm.setdefault("title",   raw.get("doc_title")     or raw.get("section_title"))
+            norm.setdefault("section", raw.get("section_title"))
+            norm.setdefault("source",  raw.get("source")        or raw.get("source_filename"))
+            # year 可能是字符串，转成 int（UI 用起来更舒服，转失败就保留原值）
+            try:
+                if "year" in raw and raw["year"] not in (None, ""):
+                    norm["year"] = int(str(raw["year"]).strip()[:4])
+            except Exception:
+                norm.setdefault("year", raw.get("year"))
+            
             out.append({
                 "id": _id,
                 "content": content,
-                "meta": meta,
+                "meta": norm,   # 👈 用规范化后的 meta, 给每条命中的 meta 增补一层兼容字段
                 "score": 1.0 - dist,
             })
         return out
@@ -468,20 +498,6 @@ def hybrid_search(query: str, k: int = 8, use_sqlite: bool = True) -> List[Dict[
 # =============================================================================
 # 10) Diagnostics helpers — Streamlit UI can call these directly
 # =============================================================================
-
-def _pretty(hits: List[Dict[str, Any]]) -> None:
-    for i, h in enumerate(hits, 1):
-        m = h.get("meta") or {}
-        title = m.get("title") or m.get("section") or ""
-        src   = m.get("source") or ""
-        typ   = m.get("type") or ""
-        line1 = (h.get("content") or "").strip().replace("\n", " ")
-        print(f"{i:>2}. score={h.get('score',0):.3f} rrf={h.get('rrf',0):.4f} | {title} [{typ}] | {src}")
-        if line1:
-            print("    ", (line1[:160] + "…") if len(line1) > 160 else line1)
-
-# ---- Diagnostics helpers (called from app.py) ----
-from typing import Any, Dict, List
 
 def list_collections_safe(max_items: int = 100) -> List[Dict[str, Any]]:
     """

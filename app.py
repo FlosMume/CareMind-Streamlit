@@ -94,9 +94,13 @@ def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
     lines = []
     for i, h in enumerate(hits or [], 1):
         m = h.get("meta") or {}
-        title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
-        source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
-        year   = str(m.get("year")   or "—")
+        # title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
+        # source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
+        # year   = str(m.get("year")   or "—")
+        title  = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
+        source = (m.get("source") or m.get("source_filename") or "Unknown")
+        year   = (m.get("year") or "")
+        
         head = (
             f"### #{i} {title}\n\n"
             + (f"- 来源：{source} · 年份：{year}\n\n" if lang == "zh"
@@ -432,9 +436,12 @@ if res:
 
             for i, h in enumerate(hits, 1):
                 m = h.get("meta") or {}
-                title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
-                source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
-                year   = str(m.get("year")   or "—")
+                # title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
+                # source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
+                # year   = str(m.get("year")   or "—")
+                title  = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
+                source = (m.get("source") or m.get("source_filename") or "Unknown")
+                year   = (m.get("year") or "")
                 doc_id = str(m.get("id")     or "—")
                 label = f"#{i} · {title[:60]}"
                 st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
@@ -508,14 +515,12 @@ def render_diagnostics(lang: str = "zh") -> None:
         except Exception as e:
             st.warning(t(lang, "diag_chroma_err") + str(e))
 
-
         try:
             count = R.primary_collection_count()
             st.markdown(f"**Chunks in active collection (`{os.getenv('CHROMA_COLLECTION')}`)**: `{count}`")
         except Exception:
             st.markdown("**Chunks in active collection**: `-`")
 
-        #(Make the retriever truly “single-client” & add a chunk counter API.)
         # SQLite 存在性与表
         db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
         abs_db = os.path.abspath(db_path)

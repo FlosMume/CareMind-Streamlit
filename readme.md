@@ -45,8 +45,8 @@ caremind-streamlit/
 ├── chroma_store/           # Vector DB persistence (local / demo branch)
 ├── requirements.txt        # Python dependencies
 └── .streamlit/config.toml  # Streamlit UI configuration
-```
 
+```
 ## ⚙️ Installation
 ```
 
@@ -72,6 +72,7 @@ python ingest/create_db.py \
 5. Run Streamlit
 streamlit run app.py
 The app will be available at http://localhost:8501.
+
 ```
 ## 🌐 Deployment
 ```
@@ -112,7 +113,6 @@ For major changes, please open an issue first to discuss.
 ```
 MIT License © 2025 Samuel Huang
 ```
-
 ## 🤝 Contribution
 ```
 Pull requests are welcome.

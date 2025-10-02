@@ -1,0 +1,4 @@
+chroma_store_clean/** -text merge=ours
+*.sqlite  -text merge=ours
+*.sqlite3 filter=lfs diff=lfs merge=lfs -text
+chroma_store/** filter=lfs diff=lfs merge=lfs -text
