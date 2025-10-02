@@ -14,8 +14,17 @@ CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 """
 
 from __future__ import annotations
-
+# --- SQLite bootstrap for Chroma on Streamlit Cloud ---
+try:
+    import pysqlite3  # must be installed via requirements.txt
+    import sys
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    pass
+# ------------------------------------------------------
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import re
 import sys
 import json
@@ -29,6 +38,8 @@ import streamlit as st
 from rag import retriever as R  # noqa: F401   # 用于 shim 与缓存化的 Chroma 客户端
 import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
 import sqlite3
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # =============================================================================
@@ -325,12 +336,16 @@ with st.form("cm_query"):
 # =============================================================================
 # 6) 页签：建议 / 证据片段 / 药品结构化 / 运行日志
 # -----------------------------------------------------------------------------
-tab_adv, tab_hits, tab_drug, tab_log = st.tabs([
-    t(lang, "tab_advice"),
-    t(lang, "tab_hits"),
-    t(lang, "tab_drug"),
-    t(lang, "tab_log"),
-])
+# tab_adv, tab_hits, tab_drug, tab_log = st.tabs([
+#     t(lang, "tab_advice"),
+#    t(lang, "tab_hits"),
+#    t(lang, "tab_drug"),
+#    t(lang, "tab_log"),
+#])
+
+tab_adv, tab_evidence, tab_drug, tab_hits, tab_log = st.tabs(["🧭 建议", "📑 证据清单", "🎯命中", "💊 药品结构化", "🪵 运行日志"])
+
+
 
 res: Optional[Dict[str, Any]] = None
 elapsed: Optional[float] = None
@@ -378,7 +393,8 @@ if res:
     with tab_adv:
         st.subheader(t(lang, "advice_hdr"))
         output_text = link_citations(res.get("output") or "")
-        st.markdown(f"<div class='cm-output'>{output_text}</div>", unsafe_allow_html=True)
+        #st.markdown(f"<div class='cm-output'>{output_text}</div>", unsafe_allow_html=True)
+        st.markdown(res.get("output", ""), unsafe_allow_html=False)
         if elapsed is not None:
             st.caption(t(lang, "time_used").format(elapsed))
         # 1) full-width preview
@@ -405,8 +421,14 @@ if res:
                 disabled=not bool((ev_md or "").strip()),
             )
         st.caption(t(lang, "disclaimer"))
-
+      
     # --- 证据片段 ---
+
+    # --- 证据页签：只显示一次（后端整理的证据清单） ---
+    with tab_evidence:
+        ev = res.get("guideline_hits_md") or "（暂无证据片段）"
+        st.markdown(ev, unsafe_allow_html=False)
+
     with tab_hits:
         hits: List[Dict[str, Any]] = res.get("guideline_hits") or []
 
@@ -485,6 +507,13 @@ if res:
             use_container_width=True,
         )
 
+    with st.expander("⚙️ 开发者工具 / Dev tools"):
+        if st.button("🔄 清理后端缓存 (Chroma Client/Collection)"):
+            try:
+                st.cache_resource.clear()
+                st.success("已清理，请重新提交查询。")
+            except Exception as e:
+                st.error(f"清理失败：{e}")
 
 # =============================================================================
 # 9) 诊断面板（始终可见；统一使用 retriever 的安全接口）
@@ -536,6 +565,11 @@ def render_diagnostics(lang: str = "zh") -> None:
             st.json(tables)
         except Exception as e:
             st.warning(t(lang, "diag_sqlite_err") + str(e))
+
+APPEND_DISCLAIMER = False  # 统一由 prompt 生成
+
+if APPEND_DISCLAIMER:
+    st.info("本工具仅供临床决策参考，不替代医师诊断与处方。")
 
 # 页面底部渲染诊断
 render_diagnostics(lang)

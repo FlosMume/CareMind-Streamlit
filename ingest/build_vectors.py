@@ -89,7 +89,8 @@ DATA_PATH        = os.getenv("CAREMIND_DATA", "data/guidelines.parsed.jsonl")
 
 # Chinese-capable model; bge-* are strong + efficient. Start small on 12GB VRAM.
 # EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh")
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh")
+# EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh")
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
 
 # Start conservatively; dynamic backoff will reduce further on OOM.
 START_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "16"))

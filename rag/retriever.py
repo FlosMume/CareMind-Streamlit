@@ -64,6 +64,9 @@ import json
 import glob
 import contextlib
 from typing import Any, Dict, List, Optional, Tuple
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # =============================================================================
 # 0) Lightweight logging + path helpers
@@ -273,7 +276,7 @@ def _premigrate_sysdb(persist_dir: str) -> int:
 # =============================================================================
 
 @cache_resource
-def get_chroma_client(persist_dir: Optional[str] = None):
+def get_chroma_client(persist_dir: Optional[str] = None, version: str = VERSION):
     """
     Create (once) and return a PersistentClient, after a best-effort pre-migration.
     Using st.cache_resource guarantees a single instance per Streamlit process,
@@ -298,25 +301,31 @@ def get_chroma_client(persist_dir: Optional[str] = None):
     )
 
 @cache_resource
-def get_chroma_collection(name: Optional[str] = None, embed_model: Optional[str] = None):
+def get_chroma_collection(
+    name: Optional[str] = None, 
+    embed_model: Optional[str] = None,
+    persist_dir: Optional[str] = None,
+    version: str = VERSION,
+    ):
     """
     Open and cache the primary collection. We try `get_collection()` first
     (don’t silently create a brand new empty one), and if missing, we print
     the available names to guide debugging, then optionally create an empty
     collection so the app doesn’t crash.
     """
-    client = get_chroma_client()
+    client = get_chroma_client(persist_dir=persist_dir, version=version)
     embed_fn = _ChromaEmbedFn(_EMBED if not embed_model else _LazyEmbedder(embed_model))
     target = (name or CHROMA_COLLECTION)
     try:
         return client.get_collection(target, embedding_function=embed_fn)
-    except Exception:
+    except Exception as e:
         with contextlib.suppress(Exception):
             names = [c.name for c in client.list_collections()]
             _log(f"⚠️ Collection '{target}' not found in {CHROMA_PERSIST_DIR}. Available: {names}")
         # Fallback: create (empty) to avoid hard crash — UI can show count=0.
-        return client.get_or_create_collection(target, embedding_function=embed_fn)
-
+        # return client.get_or_create_collection(target, embedding_function=embed_fn)
+        # 调试期：直接抛错，不要创建空集合
+        raise
 
 # =============================================================================
 # 7) Public API — Vector search over guideline chunks
@@ -342,11 +351,15 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
     if not q:
         return []
     try:
-        col = get_chroma_collection()
+        col = get_chroma_collection(
+            name=CHROMA_COLLECTION,
+            embed_model=EMBEDDING_MODEL,
+            persist_dir=CHROMA_PERSIST_DIR,
+            )
         res = col.query(
             query_texts=[q],
             n_results=max(1, int(k)),
-            include=["documents", "metadatas", "distances", "ids"],
+            include=["documents", "metadatas", "distances"],
         )
         ids   = (res.get("ids") or [[]])[0]
         docs  = (res.get("documents") or [[]])[0]
@@ -382,7 +395,9 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
         return out
     except Exception as e:
         _log("search_guidelines error:", repr(e))
-        return []
+        # return []
+        # 调试期：抛出给 Streamlit，让错误直接在页面可见
+        raise        
 
 
 # =============================================================================
@@ -531,7 +546,11 @@ def primary_collection_count() -> int:
     -1 → a counting error occurred (the UI can render this as a warning).
     """
     try:
-        col = get_chroma_collection()
+        col = get_chroma_collection(
+            name=CHROMA_COLLECTION,
+            embed_model=EMBEDDING_MODEL,
+            persist_dir=CHROMA_PERSIST_DIR,
+            )
         return int(col.count())
     except Exception as e:
         _log("primary_collection_count error:", repr(e))
