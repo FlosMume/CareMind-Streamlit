@@ -28,4 +28,4 @@ pysqlite3-binary==0.5.2.post3
 
 # --- Documents / PDF ---
 pdfplumber==0.11.4
-sqlite-utils==3.37.1
+sqlite-utils>=3.37,<3.39
