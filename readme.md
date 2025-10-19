@@ -113,12 +113,3 @@ For major changes, please open an issue first to discuss.
 ```
 MIT License © 2025 Samuel Huang
 ```
-## 🤝 Contribution
-```
-Pull requests are welcome.
-For major changes, please open an issue first to discuss.
-```
-## 📜 License
-```
-MIT License © 2025 Samuel Huang
-```
