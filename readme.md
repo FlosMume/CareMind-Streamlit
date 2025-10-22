@@ -77,9 +77,11 @@ The app will be available at http://localhost:8501.
 ## 🌐 Deployment
 ```
 
-Local: Works on Windows/WSL + GPU (RTX 4070 SUPER tested)
+### Local:
 
-Streamlit Cloud:
+Works on Windows/WSL + GPU (RTX 4070 SUPER tested)
+
+### Streamlit Cloud:
 
 main branch: minimal demo (no full dataset)
 
