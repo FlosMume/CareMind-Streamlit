@@ -16,7 +16,7 @@ This document covers functional testing, integration testing, and validation of 
 ### 1. Unit Testing
 - Validate individual modules (retriever, pipeline, formatter).
 - Example tests:
-  - **Retriever**: returns correct number of results given `k`.
+  - **Retriever**: returns correct number of results given `k` (the number of most similar document chunks).
   - **Pipeline**: handles empty evidence gracefully.
   - **Formatter**: produces Markdown-compliant output.
 
