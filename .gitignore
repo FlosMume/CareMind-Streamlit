@@ -13,6 +13,7 @@ __pycache__/
 *.bin
 *.pt
 *.pkl
+*_legacy.*
 
 # 忽略虚拟环境
 .venv/
