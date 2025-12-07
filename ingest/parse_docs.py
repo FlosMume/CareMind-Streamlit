@@ -6,7 +6,7 @@
 
 # %%
 from pathlib import Path
-import pdfplumber 
+import pdfplumber   # PDF text extraction library
 import re
 import json
 from typing import List, Dict, Any
@@ -19,33 +19,33 @@ from typing import List, Dict, Any
 def extract_year_from_filename(filename: str) -> str:
     """Extracts 4-digit year from Chinese medical guideline filenames."""
     patterns = [
-        r'[（\(]([12]\d{3})[）\)]',
-        r'[（\(]([12]\d{3})[年\s]*(?:修订版|版|年版|年)?[）\)]?',
-        r'([12]\d{3})[年\s]*(?:修订版|版|年版|年)?(?=[\s_）\)。\.\-]|$)',
-        r'[（\(]?([12]\d{3})[）\)]?\s*\.pdf$',
-    ]
+        r'[（\(]([12]\d{3})[）\)]', # (2023版)
+        r'[（\(]([12]\d{3})[年\s]*(?:修订版|版|年版|年)?[）\)]?', # (2023版)
+        r'([12]\d{3})[年\s]*(?:修订版|版|年版|年)?(?=[\s_）\)。\.\-]|$)', # 2023版
+        r'[（\(]?([12]\d{3})[）\)]?\s*\.pdf$', # 2023.pdf
+    ] # Various patterns to match year
     for pattern in patterns:
-        match = re.search(pattern, filename)
+        match = re.search(pattern, filename) # Search for pattern
         if match:
             return match.group(1)
     return "unknown"
 
 def extract_doc_title(filename: str) -> str:
     """Extract clean document title from filename."""
-    base = re.sub(r"_[^_]*\.pdf$", "", filename)
-    base = re.sub(r"\.pdf$", "", base)
-    base = re.sub(r"[（\(][^）\)]*[）\)]", "", base)
-    base = re.sub(r"\s*—+\s*", " ", base)
-    base = re.sub(r"\s+", " ", base).strip()
-    return base or "未命名文档"
+    base = re.sub(r"_[^_]*\.pdf$", "", filename) # Remove author and extension
+    base = re.sub(r"\.pdf$", "", base) # Remove extension if still present
+    base = re.sub(r"[（\(][^）\)]*[）\)]", "", base) # Remove year/version info
+    base = re.sub(r"\s*—+\s*", " ", base) # Replace dashes with space
+    base = re.sub(r"\s+", " ", base).strip() # Normalize whitespace
+    return base or "未命名文档" # Fallback title
 
 def extract_authors_from_filename(filename: str) -> List[str]:
     """Extract author names from filename (after last underscore)."""
-    match = re.search(r"_([^_\(]+?)(?:\([12]\d{3}\))?\.pdf$", filename)
+    match = re.search(r"_([^_\(]+?)(?:\([12]\d{3}\))?\.pdf$", filename) # Match after last underscore
     if match:
-        author_str = match.group(1).strip()
-        authors = re.split(r"[,，、]", author_str)
-        return [a.strip() for a in authors if a.strip()]
+        author_str = match.group(1).strip() # Split by common delimiters
+        authors = re.split(r"[,，、]", author_str) # returns a list of substrings from author_str broken at any of those delimiters.
+        return [a.strip() for a in authors if a.strip()] # Filter out empty names
     return []
 
 def extract_doc_type_from_filename(filename: str) -> str:
@@ -81,62 +81,62 @@ def extract_metadata_from_text(text: str) -> Dict[str, Any]:
         "publish_date": "",
         "original_guideline_title": "",
         "doc_type": "other"  # Will be overridden if detected
-    }
+    } # Initialize metadata dictionary
 
     # Extract author (first non-empty line after title, before postal code or affiliation)
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()] #
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()] # Non-empty lines
     for i, line in enumerate(lines[:10]):  # Look in first 10 lines
         if re.match(r"^\d{6}", line):  # Postal code → previous line is likely author
             if i > 0:
-                author_line = lines[i-1]
-                authors = re.split(r"[,，、]", author_line)
-                meta["authors"] = [a.strip() for a in authors if len(a.strip()) >= 2]
+                author_line = lines[i-1] # Previous line
+                authors = re.split(r"[,，、]", author_line) # Split by common delimiters
+                meta["authors"] = [a.strip() for a in authors if len(a.strip()) >= 2] # Filter short names
             break
         if "通信作者" in line:
-            author_match = re.search(r"通信作者[:：]\s*([^\s，,、]+)", line)
+            author_match = re.search(r"通信作者[:：]\s*([^\s，,、]+)", line) # Extract corresponding author
             if author_match:
-                meta["corresponding_author"] = author_match.group(1).strip()
+                meta["corresponding_author"] = author_match.group(1).strip() # Corresponding author
                 if not meta["authors"]:
-                    meta["authors"] = [meta["corresponding_author"]]
+                    meta["authors"] = [meta["corresponding_author"]] # Fallback to corresponding author
 
     # Extract affiliation (lines with postal code or university)
     for line in lines[:15]:
-        if re.search(r"\d{6}|大学|医院|中心", line) and len(line) > 10:
-            meta["affiliations"].append(line)
+        if re.search(r"\d{6}|大学|医院|中心", line) and len(line) > 10: # Likely affiliation line
+            meta["affiliations"].append(line) # Collect affiliations
 
     # Extract DOI
-    doi_match = re.search(r"DOI\s*[:：]?\s*([0-9\.\s\/a-z-]+)", text, re.IGNORECASE)
+    doi_match = re.search(r"DOI\s*[:：]?\s*([0-9\.\s\/a-z-]+)", text, re.IGNORECASE) # DOI pattern
     if doi_match:
-        meta["doi"] = re.sub(r"\s+", "", doi_match.group(1)).strip()
+        meta["doi"] = re.sub(r"\s+", "", doi_match.group(1)).strip() # Clean DOI
 
     # Extract journal, volume, issue, pages from footer pattern
     # e.g., "·396· 中国心血管杂志 2024年 10月第 29卷第 5期"
-    journal_match = re.search(r"·\d+·\s*([^\s]+?杂志|学报)\s*(\d{4})年\s*\d+月第\s*(\d+)卷第\s*(\d+)期", text)
+    journal_match = re.search(r"·\d+·\s*([^\s]+?杂志|学报)\s*(\d{4})年\s*\d+月第\s*(\d+)卷第\s*(\d+)期", text) # 
     if journal_match:
-        meta["journal_name"] = journal_match.group(1).strip()
+        meta["journal_name"] = journal_match.group(1).strip()  # e.g., "中国心血管杂志"
         meta["publish_date"] = journal_match.group(2).strip()  # e.g., "2024"
-        meta["volume"] = journal_match.group(3).strip()
-        meta["issue"] = journal_match.group(4).strip()
+        meta["volume"] = journal_match.group(3).strip() # e.g., "29"
+        meta["issue"] = journal_match.group(4).strip()  # e.g., "5"
 
     # Extract pages from header/footer (e.g., "·396·")
-    page_match = re.search(r"·(\d+)·", text.splitlines()[0] if text.splitlines() else "")
+    page_match = re.search(r"·(\d+)·", text.splitlines()[0] if text.splitlines() else "") # First line
     if page_match:
-        start_page = page_match.group(1)
+        start_page = page_match.group(1) # e.g., "396"
         # Try to find end page (often not available, so leave as single page)
         meta["pages"] = start_page
 
     # Extract keywords
-    kw_match = re.search(r"【关键词】\s*([^\n【】]+)", text)
+    kw_match = re.search(r"【关键词】\s*([^\n【】]+)", text) # Keywords pattern
     if kw_match:
-        kw_str = kw_match.group(1).strip()
-        meta["keywords"] = [k.strip() for k in re.split(r"[,，;；、]", kw_str) if k.strip()]
+        kw_str = kw_match.group(1).strip() # Raw keyword string
+        meta["keywords"] = [k.strip() for k in re.split(r"[,，;；、]", kw_str) if k.strip()] # Split and clean
 
     # Detect if this is an interpretation of a guideline
-    guideline_ref_match = re.search(r"《([^》]+?指南[^》]*)》", text[:500])
+    guideline_ref_match = re.search(r"《([^》]+?指南[^》]*)》", text[:500]) # Look for guideline reference
     if guideline_ref_match:
-        meta["original_guideline_title"] = guideline_ref_match.group(1).strip()
+        meta["original_guideline_title"] = guideline_ref_match.group(1).strip() # Extracted guideline title
         if "解读" in text[:200] or "浅析" in text[:200]:
-            meta["doc_type"] = "guideline_interpretation"
+            meta["doc_type"] = "guideline_interpretation" # Mark as interpretation
 
     # If no authors found but filename has them, fallback
     # (Handled in main function)
@@ -151,11 +151,11 @@ def extract_metadata_from_text(text: str) -> Dict[str, Any]:
 def extract_text_from_pdf(pdf_path: Path) -> str:
     """Extract text from PDF using pdfplumber."""
     try:
-        with pdfplumber.open(str(pdf_path)) as pdf: 
-            pages = [p.extract_text() or "" for p in pdf.pages] 
+        with pdfplumber.open(str(pdf_path)) as pdf:  # Open PDF
+            pages = [p.extract_text() or "" for p in pdf.pages] # Extract text from each page
         return "\n".join(pages)
     except Exception as e:
-        print(f"⚠️  PDF extraction error: {e}")
+        print(f"⚠️  PDF extraction error: {e}") # Log error
         return ""
 
 # %%
@@ -180,7 +180,7 @@ def chunk_by_rules(
     publish_date: str = ""
 ) -> List[Dict[str, Any]]:
     """Split text into chunks by section titles, with rich metadata."""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()] # Non-empty lines
     if not lines:
         return []
 
@@ -199,19 +199,19 @@ def chunk_by_rules(
     for ln in lines:
         is_title = False
 
-        if any(kw in ln for kw in TITLE_KEYWORDS) and 3 <= len(ln) <= 100:
+        if any(kw in ln for kw in TITLE_KEYWORDS) and 3 <= len(ln) <= 100: # Heuristic for titles
             is_title = True
         elif ln.endswith("：") or ln.endswith(":") or \
-             (len(ln) <= 50 and (ln.startswith("【") and ln.endswith("】"))):
+             (len(ln) <= 50 and (ln.startswith("【") and ln.endswith("】"))): # Likely title
             is_title = True
-        elif 3 <= len(ln) <= 25 and not ln.endswith("。") and not ln.endswith("."):
+        elif 3 <= len(ln) <= 25 and not ln.endswith("。") and not ln.endswith("."): #
             is_title = True
-        elif re.match(r"^[0-9]+[\.、]\s*\S{3,}", ln):
+        elif re.match(r"^[0-9]+[\.、]\s*\S{3,}", ln): # Numbered section
             is_title = True
 
         if is_title:
             if buf:
-                chunk_id = f"{re.sub(r'[^a-zA-Z0-9]', '_', doc_title)}_{year}_{len(chunks):03d}"
+                chunk_id = f"{re.sub(r'[^a-zA-Z0-9]', '_', doc_title)}_{year}_{len(chunks):03d}" # Unique chunk ID
                 chunk_meta = {
                     "source_filename": source_filename,
                     "doc_title": doc_title,
@@ -241,7 +241,7 @@ def chunk_by_rules(
 
     # Flush final buffer
     if buf:
-        chunk_id = f"{re.sub(r'[^a-zA-Z0-9]', '_', doc_title)}_{year}_{len(chunks):03d}"
+        chunk_id = f"{re.sub(r'[^a-zA-Z0-9]', '_', doc_title)}_{year}_{len(chunks):03d}" # Unique chunk ID
         chunk_meta = {
             "source_filename": source_filename,
             "doc_title": doc_title,
@@ -261,8 +261,8 @@ def chunk_by_rules(
             "extraction_method": "pdfplumber + rule-based + metadata extraction"
         }
         chunks.append({
-            "content": "\n".join(buf),
-            "meta": chunk_meta
+            "content": "\n".join(buf), # Final chunk
+            "meta": chunk_meta # Final chunk metadata
         })
 
     return chunks
@@ -277,7 +277,7 @@ def main():
     out_path = Path("data/guidelines.parsed.jsonl")
 
     print(f"📂 Input directory: {in_dir.absolute()}")
-    pdf_files = list(in_dir.glob("*.pdf"))
+    pdf_files = list(in_dir.glob("*.pdf")) # List all PDF files
     print(f"📄 Found {len(pdf_files)} PDF files.")
 
     if not pdf_files:
