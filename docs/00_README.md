@@ -13,3 +13,25 @@ This folder contains technical notes, operations/deployment guides, and project 
 ## Notes
 
 - Project doc / planning notes: [docs/notes/caremind_doc.txt](notes/caremind_doc.txt)
+
+## Documentation Metadata Policy
+
+Use Git history as the primary source of authorship. Only add explicit metadata blocks when the document is an operational record or requires accountability.
+
+### MUST include `Author:` (and optionally `Assisted by:`)
+
+- Operational runbooks and deployment guides under `docs/guides/` (example: `deployment_cloud.md`).
+
+### MAY include a `Certificate` section
+
+- Only for documents that record a specific executed state/event (e.g., a Cloud deployment configuration that was validated on a given date).
+
+### SHOULD NOT include Author/Certificate blocks
+
+- General technical docs (architecture, data ingestion, code reference, testing notes).
+- Root `readme.md` (keep it product-focused; rely on Git for authorship).
+
+### Style rules (keep it light)
+
+- Prefer a short header block: `Author:` + `Last updated:`.
+- If present, certificates should be explicit about scope/date and written as an internal record (not a legal claim).
