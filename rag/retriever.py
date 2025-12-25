@@ -98,7 +98,7 @@ os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "false")
 CHROMA_TELEMETRY_OFF = os.getenv("CHROMA_TELEMETRY_OFF", "1") not in ("0", "false", "False")
 
 CHROMA_PERSIST_DIR = _abs(os.getenv("CHROMA_PERSIST_DIR", "./chroma_store"))
-CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
+CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2")
 EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
 DRUG_DB_PATH       = _abs(os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite"))
 
@@ -375,13 +375,40 @@ def get_chroma_collection(
     try:
         return client.get_collection(target, embedding_function=embed_fn)
     except Exception as e:
-        with contextlib.suppress(Exception):
-            names = [c.name for c in client.list_collections()]
-            _log(f"⚠️ Collection '{target}' not found in {CHROMA_PERSIST_DIR}. Available: {names}")
-        # Fallback: create (empty) to avoid hard crash — UI can show count=0.
-        # return client.get_or_create_collection(target, embedding_function=embed_fn)
-        # 调试期：直接抛错，不要创建空集合
-        raise
+        cols = list_collections_safe()
+        names = [c.get("name", "") for c in cols]
+        _log(f"⚠️ Collection '{target}' does not exist in {CHROMA_PERSIST_DIR}. Available: {names}")
+
+        # If there is exactly one collection, auto-select it.
+        if len(names) == 1 and names[0]:
+            picked = names[0]
+            _log(f"Auto-selecting the only available collection: '{picked}'")
+            return client.get_collection(picked, embedding_function=embed_fn)
+
+        # If multiple collections exist, pick the one with the highest count.
+        best_name: Optional[str] = None
+        best_count = -1
+        for c in cols:
+            n = str(c.get("name") or "").strip()
+            cnt = c.get("count")
+            try:
+                cnt_i = int(cnt)
+            except Exception:
+                cnt_i = -1
+            if n and cnt_i > best_count:
+                best_name, best_count = n, cnt_i
+
+        if best_name:
+            _log(f"Auto-selecting the largest collection: '{best_name}' (count={best_count})")
+            return client.get_collection(best_name, embedding_function=embed_fn)
+
+        # No collections exist: create an empty one so the UI can load.
+        _log(
+            "No collections found. This usually means the Chroma store is missing from the deployed branch, ",
+            "or CHROMA_PERSIST_DIR points to an empty directory. ",
+            "Fix: commit `chroma_store/` to demo-data and set CHROMA_PERSIST_DIR=./chroma_store.",
+        )
+        return client.get_or_create_collection(target, embedding_function=embed_fn)
 
 # =============================================================================
 # 7) Public API — Vector search over guideline chunks
@@ -451,9 +478,7 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
         return out
     except Exception as e:
         _log("search_guidelines error:", repr(e))
-        # return []
-        # 调试期：抛出给 Streamlit，让错误直接在页面可见
-        raise        
+        return []
 
 
 # =============================================================================

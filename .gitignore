@@ -1,6 +1,6 @@
-# ========== demo-data 分支专用 .gitignore ==========
+# ========== demo-data branch .gitignore ==========
 
-# 忽略常见临时/环境文件
+# Python / editor noise
 __pycache__/
 *.pyc
 *.pyo
@@ -10,35 +10,33 @@ __pycache__/
 *.tmp
 *.bak
 .DS_Store
-*.bin
-*.pt
-*.pkl
-*_legacy.*
 
-# 忽略虚拟环境
+# Virtual environments
 .venv/
 venv/
 env/
 ENV/
+
+# Secrets (never commit)
 .env
+.streamlit/secrets.toml
 
-# 忽略本地数据库或缓存（但保留 chroma_store）
-db/
-.ingest.ckpt
-*.sqlite3
-
-# 忽略原始大数据
+# Raw source data (optional to ship)
 data/
-!data/guidelines.parsed.jsonl   # 如果需要保留小样本
+!data/guidelines.parsed.jsonl
 
-# 允许提交完整 Chroma 库（与 main 不同）
-chroma_store/**
-chroma_store*/
+# DBs: ship the demo drug DB, ignore others
+db/*.sqlite
+db/*.sqlite3
+!db/drugs.sqlite
+
+# Chroma: ship ONLY the active demo store folder
+!chroma_store/**
+
+# Avoid doubling repo size: do not commit backups/variants
 chroma_store_clean/
 chroma_store_quarantined_*/
 chroma_store_sqlite_legacy/
-
-.streamlit/secrets.toml
 
 # Local tools / scratch
 tools/
@@ -46,9 +44,6 @@ demo.py
 CompareRequirements.py
 fullRequirements.txt
 
+# Legacy / internal notes
 ingest/create_db.py
 rag/prompt_legacy.py
-rag/retriever4sqlite.pychroma_store/
-chroma_store_clean/
-db/*.sqlite
-*.sqlite
