@@ -47,3 +47,6 @@ fullRequirements.txt
 # Legacy / internal notes
 ingest/create_db.py
 rag/prompt_legacy.py
+
+# Keep Chinese variants locally but do not commit
+*_cn.py
