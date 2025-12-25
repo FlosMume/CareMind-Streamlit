@@ -63,9 +63,14 @@ import sys
 import json
 import glob
 import contextlib
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
-load_dotenv()
+
+# IMPORTANT: avoid accidentally loading a stray `.env` from outside this repo.
+# Only load a project-local `.env` (repo root) if it exists.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(dotenv_path=_PROJECT_ROOT / ".env", override=False)
 
 
 # =============================================================================
@@ -97,7 +102,7 @@ CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION", "guideline_chunks")
 EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
 DRUG_DB_PATH       = _abs(os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite"))
 
-VERSION = "retriever-2025-09-30"
+VERSION = "retriever-2025-12-25"
 
 
 # =============================================================================
@@ -222,12 +227,22 @@ def _sysdb_paths(persist_dir: str) -> List[str]:
     pats = [
         os.path.join(persist_dir, "chroma-*.db"),   # modern layout
         os.path.join(persist_dir, "chroma.sqlite"), # older
+        os.path.join(persist_dir, "chroma.sqlite3"), # common repo layout
         os.path.join(persist_dir, "chroma.db"),     # very old
     ]
     files: List[str] = []
     for p in pats:
         files.extend(glob.glob(p))
     return [f for f in files if os.path.isfile(f)]
+
+
+def _table_has_column(cur: sqlite3.Cursor, table: str, column: str) -> bool:
+    try:
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+        return column in cols
+    except Exception:
+        return False
 
 def _has_type(conf: Optional[str]) -> bool:
     if not conf:
@@ -238,7 +253,7 @@ def _has_type(conf: Optional[str]) -> bool:
     except Exception:
         return False
 
-def _premigrate_sysdb(persist_dir: str) -> int:
+def _premigrate_sysdb(persist_dir: str, patch_topic_cols: bool = True) -> int:
     """
     Patch rows in `collections` where `configuration` is NULL/empty or lacks `_type`.
     Returns how many rows were updated across all discovered sysdb files.
@@ -251,18 +266,45 @@ def _premigrate_sysdb(persist_dir: str) -> int:
         try:
             con = sqlite3.connect(dbfile)
             cur = con.cursor()
-            cur.execute("SELECT id, configuration FROM collections")
-            rows = cur.fetchall()
-            fixed = 0
-            for cid, conf in rows:
-                if not _has_type(conf):
-                    payload = json.dumps({"_type": "CollectionConfigurationInternal"}, ensure_ascii=False)
-                    cur.execute("UPDATE collections SET configuration=? WHERE id=?", (payload, cid))
-                    fixed += 1
-            if fixed:
-                con.commit()
-                total += fixed
-                _log(f"[premigrate] {dbfile}: patched {fixed} row(s).")
+
+            # Chroma sysdb schema drift:
+            # - chromadb < 0.5.x can crash when these columns are missing
+            # - chromadb >= 0.5.x runs its own migrations; pre-adding columns can
+            #   break migrations (e.g., INSERT ... SELECT * into a temp table).
+            if patch_topic_cols:
+                if not _table_has_column(cur, "collections", "topic"):
+                    cur.execute("ALTER TABLE collections ADD COLUMN topic TEXT DEFAULT ''")
+                    con.commit()
+                    _log(f"[premigrate] {dbfile}: added missing collections.topic")
+
+                if _table_has_column(cur, "segments", "id") and not _table_has_column(cur, "segments", "topic"):
+                    cur.execute("ALTER TABLE segments ADD COLUMN topic TEXT DEFAULT ''")
+                    con.commit()
+                    _log(f"[premigrate] {dbfile}: added missing segments.topic")
+
+            # Some Chroma schemas store collection config as `configuration` (older)
+            # or `config_json_str` (newer). chromadb expects the JSON to contain `_type`.
+            for colname in ("configuration", "config_json_str"):
+                if not _table_has_column(cur, "collections", colname):
+                    continue
+                cur.execute(f"SELECT id, {colname} FROM collections")
+                rows = cur.fetchall()
+                fixed = 0
+                for cid, conf in rows:
+                    if not _has_type(conf):
+                        payload = json.dumps(
+                            {"_type": "CollectionConfigurationInternal"},
+                            ensure_ascii=False,
+                        )
+                        cur.execute(
+                            f"UPDATE collections SET {colname}=? WHERE id=?",
+                            (payload, cid),
+                        )
+                        fixed += 1
+                if fixed:
+                    con.commit()
+                    total += fixed
+                    _log(f"[premigrate] {dbfile}: patched {fixed} row(s) in collections.{colname}.")
         except Exception as e:
             _log(f"[premigrate] {dbfile}: error:", repr(e))
         finally:
@@ -285,7 +327,21 @@ def get_chroma_client(persist_dir: Optional[str] = None, version: str = VERSION)
     pdir = _abs(persist_dir or CHROMA_PERSIST_DIR)
     os.makedirs(pdir, exist_ok=True)
     try:
-        changed = _premigrate_sysdb(pdir)
+        # Only patch topic columns for chromadb < 0.5.0.
+        # For chromadb >= 0.5.0, let built-in migrations handle schema changes.
+        patch_topic_cols = True
+        try:
+            import chromadb  # type: ignore
+
+            ver = getattr(chromadb, "__version__", "0.0.0")
+            parts = str(ver).split(".")
+            major = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
+            minor = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+            patch_topic_cols = (major, minor) < (0, 5)
+        except Exception:
+            patch_topic_cols = True
+
+        changed = _premigrate_sysdb(pdir, patch_topic_cols=patch_topic_cols)
         if changed:
             _log(f"Premigrated collections: {changed}")
     except Exception as e:
