@@ -99,7 +99,8 @@ def _env(key: str, default: str | None = None) -> str | None:
 def link_citations(md: str) -> str:
     """把 "[#3]" / "[3]" 转为 "#hit-3" 锚点链接，便于从建议跳回证据片段。"""
     # Keep the visible text as "[n]" (not just "n") so users can see bracketed citations.
-    return re.sub(r"\[(?:#)?(\d+)\]", r"[[\1]](#hit-\1)", md or "")
+    # Use escaped brackets inside the link text to avoid Markdown parsing quirks.
+    return re.sub(r"\[(?:#)?(\d+)\]", r"[\\[\1\\]](#hit-\1)", md or "")
 
 def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
     """Split model output into (advice_md, evidence_list_md).
@@ -256,7 +257,7 @@ def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
         year   = (m.get("year") or "")
         
         head = (
-            f"### #{i} {title}\n\n"
+            f"### {i} {title}\n\n"
             + (f"- 来源：{source} · 年份：{year}\n\n" if lang == "zh"
                else f"- Source: {source} · Year: {year}\n\n")
         )
@@ -633,6 +634,7 @@ if res:
     with tab_evidence:
         hits_for_list: List[Dict[str, Any]] = res.get("guideline_hits") or []
         ev_list = evidence_list_md.strip() if evidence_list_md.strip() else evidence_list_md_from_hits(lang, hits_for_list)
+        ev_list = link_citations(ev_list)
         ev_list = normalize_evidence_list_md(ev_list, lang)
         st.markdown(ev_list, unsafe_allow_html=False)
 
@@ -672,7 +674,7 @@ if res:
                 source = (m.get("source") or m.get("source_filename") or "Unknown")
                 year   = (m.get("year") or "")
                 doc_id = str(m.get("id")     or "—")
-                label = f"#{i} · {title[:60]}"
+                label = f"{i} · {title[:60]}"
                 st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
                 with st.expander(label, expanded=False):
                     if show_meta:
