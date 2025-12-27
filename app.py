@@ -285,6 +285,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "drug_label": "（可选）指定药品名（如：阿司匹林）",
         "submit": "生成建议",
         "tab_advice": "🧭 建议",
+        "tab_evidence_list": "📑 证据清单",
+        "tab_hits_raw": "🎯 命中",
         "tab_hits": "📚 证据片段",
         "tab_drug": "💊 药品结构化",
         "tab_log": "🪵 运行日志",
@@ -343,6 +345,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "drug_label": "(Optional) Drug name (e.g., Aspirin)",
         "submit": "Generate Advice",
         "tab_advice": "🧭 Advice",
+        "tab_evidence_list": "📑 Evidence List",
+        "tab_hits_raw": "🎯 Hits (Raw)",
         "tab_hits": "📚 Evidence",
         "tab_drug": "💊 Drug (Structured)",
         "tab_log": "🪵 Run Logs",
@@ -491,7 +495,13 @@ with st.form("cm_query"):
 #    t(lang, "tab_log"),
 #])
 
-tab_adv, tab_evidence, tab_hits, tab_drug, tab_log = st.tabs(["🧭 建议", "📑 证据清单", "🎯命中", "💊 药品结构化", "🪵 运行日志"])
+tab_adv, tab_evidence, tab_hits, tab_drug, tab_log = st.tabs([
+    t(lang, "tab_advice"),
+    t(lang, "tab_evidence_list"),
+    t(lang, "tab_hits_raw"),
+    t(lang, "tab_drug"),
+    t(lang, "tab_log"),
+])
 
 
 
