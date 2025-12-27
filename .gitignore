@@ -50,3 +50,4 @@ rag/prompt_legacy.py
 
 # Keep Chinese variants locally but do not commit
 *_cn.py
+!rag/prompt_cn.py
