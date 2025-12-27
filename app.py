@@ -144,6 +144,79 @@ def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
 
     return advice, evidence_list
 
+
+def strip_redundant_advice_heading(md: str, lang: str) -> str:
+    """Remove a leading '建议：'/'Advice:' line when the UI already provides the section header."""
+    if not md:
+        return md
+    heading_only = r"(?mi)^\s*(?:\*\*|__)?\s*(建议|advice)\s*(?:\*\*|__)?\s*[:：]\s*$"
+    lines = md.splitlines()
+    # Case A: first line is just a heading like "建议：" / "Advice:"
+    if lines and re.match(heading_only, lines[0] or ""):
+        lines = lines[1:]
+        if lines and not lines[0].strip():
+            lines = lines[1:]
+        return "\n".join(lines).lstrip()
+
+    # Case B: first line starts with a redundant prefix like "建议： 结论…"
+    if lines:
+        m = re.match(r"(?i)^\s*(建议|advice)\s*[:：]\s*(.+)$", lines[0].strip())
+        if m:
+            lines[0] = m.group(2).strip()
+    return "\n".join(lines).lstrip()
+
+
+def normalize_evidence_list_md(md: str, lang: str) -> str:
+    """Normalize Evidence List: keep a single header and render each [n] entry as one line."""
+    txt = (md or "").strip()
+    if not txt:
+        return txt
+
+    hdr = "证据清单：" if lang == "zh" else "Evidence List:"
+    # Ensure header exists
+    if re.match(r"(?m)^\s*\[1\]\s+", txt) and not re.search(
+        r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]", txt
+    ):
+        txt = hdr + "\n" + txt
+
+    lines = [ln.rstrip() for ln in txt.splitlines()]
+    # Remove duplicate headers, keep the first one.
+    out_lines: List[str] = []
+    header_seen = False
+    for ln in lines:
+        if re.match(r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]\s*$", ln.strip()):
+            if header_seen:
+                continue
+            header_seen = True
+            out_lines.append(hdr)
+        else:
+            out_lines.append(ln)
+    lines = out_lines
+
+    # Collapse multi-line items into one line per [n]
+    header_line = hdr
+    items: List[str] = []
+    current: Optional[str] = None
+    for ln in lines:
+        if not ln.strip():
+            continue
+        if re.match(r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]", ln.strip()):
+            header_line = hdr
+            continue
+        if re.match(r"^\s*\[\d+\]\s+", ln):
+            if current:
+                items.append(current.strip())
+            current = ln.strip()
+        else:
+            if current:
+                current = (current + " " + ln.strip()).strip()
+    if current:
+        items.append(current.strip())
+
+    if not items:
+        return header_line
+    return (header_line + "\n" + "\n".join(items)).strip() + "\n"
+
 def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
     """Render a compact Evidence List (title/source/year only) from retrieved hits."""
     hdr = "证据清单：" if lang == "zh" else "Evidence List:"
@@ -252,7 +325,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "stats_hits": "片段数：{n} · 总字数：{c}",
         "warn_need_q": "请输入临床问题后再生成建议。",
         "err_backend": "后端错误（详见下方日志/诊断）。",
-        "diag_title": "运行日志 / 环境诊断",
+        "diag_title": "🔎 环境诊断",
         "diag_cfg": "有效配置（优先 Secrets）",
         "diag_chroma": "Chroma 集合：",
         "diag_chroma_err": "Chroma 访问错误：",
@@ -310,7 +383,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "stats_hits": "Snippets: {n} · Total chars: {c}",
         "warn_need_q": "Please enter a clinical question first.",
         "err_backend": "Backend error (see logs/diagnostics below).",
-        "diag_title": "Runtime Log / Diagnostics",
+        "diag_title": "🔎 Environment Diagnostics",
         "diag_cfg": "Effective config (Secrets-first):",
         "diag_chroma": "Chroma collections:",
         "diag_chroma_err": "Chroma access error: ",
@@ -418,7 +491,7 @@ with st.form("cm_query"):
 #    t(lang, "tab_log"),
 #])
 
-tab_adv, tab_evidence, tab_drug, tab_hits, tab_log = st.tabs(["🧭 建议", "📑 证据清单", "🎯命中", "💊 药品结构化", "🪵 运行日志"])
+tab_adv, tab_evidence, tab_hits, tab_drug, tab_log = st.tabs(["🧭 建议", "📑 证据清单", "🎯命中", "💊 药品结构化", "🪵 运行日志"])
 
 
 
@@ -490,6 +563,7 @@ if res:
         advice_md, evidence_list_md = split_advice_and_evidence_list(raw_out)
         advice_md = link_citations(advice_md)
         evidence_list_md = link_citations(evidence_list_md)
+        advice_md = strip_redundant_advice_heading(advice_md, lang)
 
         # Render only the advice section inside the Advice tab.
         st.markdown(advice_md, unsafe_allow_html=False)
@@ -525,10 +599,7 @@ if res:
     with tab_evidence:
         hits_for_list: List[Dict[str, Any]] = res.get("guideline_hits") or []
         ev_list = evidence_list_md.strip() if evidence_list_md.strip() else evidence_list_md_from_hits(lang, hits_for_list)
-        # If extracted evidence list starts directly with "[1]" (no header), add one for readability.
-        if re.match(r"(?m)^\s*\[1\]\s+", ev_list) and not re.search(r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]", ev_list):
-            hdr = "证据清单：" if lang == "zh" else "Evidence List:"
-            ev_list = (hdr + "\n" + ev_list).strip() + "\n"
+        ev_list = normalize_evidence_list_md(ev_list, lang)
         st.markdown(ev_list, unsafe_allow_html=False)
 
     with tab_hits:
