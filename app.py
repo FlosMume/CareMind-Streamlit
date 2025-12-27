@@ -100,6 +100,67 @@ def link_citations(md: str) -> str:
     """把 "[#3]" / "[3]" 转为 "#hit-3" 锚点链接，便于从建议跳回证据片段。"""
     return re.sub(r"\[(?:#)?(\d+)\]", r"[\1](#hit-\1)", md or "")
 
+def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
+    """Split model output into (advice_md, evidence_list_md).
+
+    The OpenAI prompt templates ask for two sections:
+    - "Clinical Recommendation Points" / "临床建议要点"
+    - "Evidence List" / "证据清单"
+    plus a final compliance line.
+
+    We render the Evidence List only in the Evidence tab (not inside Advice).
+    """
+    txt = (md or "").strip()
+    if not txt:
+        return "", ""
+
+    # 1) Prefer splitting on the explicit Evidence List header (English/Chinese).
+    m = re.search(
+        r"(?mi)^\s*(?:\*\*|__)?\s*(evidence\s+list|证据清单)\s*(?:\*\*|__)?\s*[:：]\s*$",
+        txt,
+    )
+
+    # 2) If the model forgot the header, fall back to splitting on the first numbered
+    #    evidence list item (e.g. "[1] ..."), which is how duplicates typically appear.
+    if not m:
+        m = re.search(r"(?m)^\s*\[\d+\]\s+", txt)
+    if not m:
+        return txt, ""
+
+    advice = txt[: m.start()].rstrip()
+    evidence_block = txt[m.start():].strip()
+
+    # Remove a trailing single-line compliance statement from the evidence block.
+    lines = [ln.rstrip() for ln in evidence_block.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines:
+        last = lines[-1].strip()
+        if re.match(r"(?i)^this tool is for clinical decision reference only\b", last) or re.match(
+            r"(?i)^compliance\s+note:\b", last
+        ) or re.match(r"^本工具仅供临床决策参考\b", last) or re.match(r"^合规提示：本工具\b", last):
+            lines.pop()
+    evidence_list = "\n".join(lines).strip()
+
+    return advice, evidence_list
+
+def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
+    """Render a compact Evidence List (title/source/year only) from retrieved hits."""
+    hdr = "证据清单：" if lang == "zh" else "Evidence List:"
+    if not hits:
+        return hdr + "\n" + ("（暂无证据片段）" if lang == "zh" else "(No evidence snippets available.)")
+
+    lines = [hdr]
+    for i, h in enumerate(hits or [], 1):
+        m = h.get("meta") or {}
+        title = (m.get("title") or m.get("doc_title") or m.get("section_title") or ("无标题" if lang == "zh" else "Untitled"))
+        source = (m.get("source") or m.get("source_filename") or ("未知来源" if lang == "zh" else "Unknown"))
+        year = (m.get("year") or "")
+        yr = f"{year}".strip()
+        tail = (f"（{yr}）" if lang == "zh" else f"({yr})") if yr else ""
+        lines.append(f"[{i}] {title} — {source} {tail}".rstrip())
+    return "\n".join(lines).strip() + "\n"
+
 def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
     """将证据片段渲染为 Markdown（用于下载）。"""
     lines = []
@@ -392,24 +453,27 @@ if res:
     # --- 建议 ---
     with tab_adv:
         st.subheader(t(lang, "advice_hdr"))
-        output_text = link_citations(res.get("output") or "")
-        #st.markdown(f"<div class='cm-output'>{output_text}</div>", unsafe_allow_html=True)
-        st.markdown(res.get("output", ""), unsafe_allow_html=False)
+        raw_out = res.get("output") or ""
+        advice_md, evidence_list_md = split_advice_and_evidence_list(raw_out)
+        advice_md = link_citations(advice_md)
+        evidence_list_md = link_citations(evidence_list_md)
+
+        # Render only the advice section inside the Advice tab.
+        st.markdown(advice_md, unsafe_allow_html=False)
         if elapsed is not None:
             st.caption(t(lang, "time_used").format(elapsed))
-        # 1) full-width preview
-        st.code(output_text, language="markdown")
+
         # 2) compact downloads below, side-by-side
         ev_md = evidence_md(lang, res.get("guideline_hits") or [])
         b1, b2, _spacer = st.columns([1, 1, 4])
         with b1:
             st.download_button(
                 t(lang, "export_advice"),
-                data=(output_text or "").encode("utf-8"),
+                data=(advice_md or "").encode("utf-8"),
                 file_name="caremind_advice.md",
                 mime="text/markdown",
                 use_container_width=True,
-                disabled=not bool((output_text or "").strip()),
+                disabled=not bool((advice_md or "").strip()),
             )
         with b2:
             st.download_button(
@@ -426,8 +490,13 @@ if res:
 
     # --- 证据页签：只显示一次（后端整理的证据清单） ---
     with tab_evidence:
-        ev = res.get("guideline_hits_md") or "（暂无证据片段）"
-        st.markdown(ev, unsafe_allow_html=False)
+        hits_for_list: List[Dict[str, Any]] = res.get("guideline_hits") or []
+        ev_list = evidence_list_md.strip() if evidence_list_md.strip() else evidence_list_md_from_hits(lang, hits_for_list)
+        # If extracted evidence list starts directly with "[1]" (no header), add one for readability.
+        if re.match(r"(?m)^\s*\[1\]\s+", ev_list) and not re.search(r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]", ev_list):
+            hdr = "证据清单：" if lang == "zh" else "Evidence List:"
+            ev_list = (hdr + "\n" + ev_list).strip() + "\n"
+        st.markdown(ev_list, unsafe_allow_html=False)
 
     with tab_hits:
         hits: List[Dict[str, Any]] = res.get("guideline_hits") or []

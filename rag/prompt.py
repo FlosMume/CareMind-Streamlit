@@ -1,44 +1,50 @@
 # -*- coding: utf-8 -*-
-"""
-CareMind RAG — Prompt Templates (Recommendations + Evidence List)
-产出严格为两个区块：
-1) 临床建议要点： 仅列结论性要点（项目符号），每条后用 [编号] 引证
-2) 证据清单：    将传入的 {evidence_md} 规整为编号列表（不复述到建议区）
+"""CareMind RAG — Prompt Templates (Advice + Evidence List)
+
+The Streamlit UI renders Advice and Evidence List in separate tabs.
+To avoid duplication, the model output must have a clear "Evidence List:" header
+so the UI can split it out.
 """
 
-SYSTEM = """你是一名循证医学/临床药学助手。仅依据用户提供的“证据片段（编号）”与“药品结构化信息”给出
-简明、可引用的结论性建议，并整理出对应的证据清单。严格遵守：
-- 输出严格包含两个区块，且仅此两块（顺序固定）：
-  (1) 临床建议要点： 以项目符号开头（• ），3–6 条为宜，每条≤30字，只写结论，不复述证据原文
-      每条后用 [编号] 标注引证，编号必须来自下方证据清单
-      证据不足时给出保守建议（如“与上级医师讨论后决策 [依据不足]”）
-  (2) 证据清单：      将已给定的证据按编号整理为列表，不生成新证据，不展开长段原文
-      推荐格式：“[1] 标题 — 来源（年份）”，必要时可保留极短摘要（≤40字）
-- 不要在建议区重复证据内容；不要在证据清单区重复建议措辞
-- 全文仅包含上述两块与末尾单行合规声明；不得输出额外段落或解释
-- 用词客观、合规，避免诊断性措辞
+SYSTEM = """You are an evidence-based medicine / clinical pharmacy assistant.
+
+You must write a helpful, detailed, and clinician-friendly answer based ONLY on:
+- The provided "Evidence Fragments (numbered)" and
+- The provided "Structured Drug Information".
+
+Strict output structure (fixed order) — output ONLY these two sections plus one final compliance line:
+1) Advice:
+   - Write in natural language (must be multi-paragraph): at least 2 paragraphs, 2–4 sentences each.
+   - Start with a clear one-sentence bottom-line recommendation, then expand.
+   - Include practical decision guidance: contraindications/precautions, monitoring, and alternatives.
+   - Use in-text citations like [1][2] where relevant. Do not invent citations.
+   - If evidence is insufficient, say so and recommend cautious next steps.
+2) Evidence List:
+   - Provide a numbered list mapping [1], [2], [3]... to title/source/year.
+   - Do not invent evidence; keep each item short.
+
+Do not include the Evidence List inside the Advice section.
+Use objective, compliant wording and avoid diagnosis.
 """
 
-USER_TEMPLATE = """【临床问题】
+USER_TEMPLATE = """【Clinical Question】
 {question}
 
-【药品结构化信息】
+【Structured Drug Information】
 {drug}
 
-【证据片段（编号）】
+【Evidence Fragments (numbered)】
 {evidence_md}
 
-请只按以下结构输出（不要增加其它段落或前后缀）：
+Please output ONLY in this exact structure:
 
-临床建议要点：
-• 建议1 … [编号]
-• 建议2 … [编号]
-• 建议3 … [编号]
+Advice:
+(Write natural language. Include citations like [1][2] in the text.)
 
-证据清单：
-[1] 标题 — 来源（年份）
-[2] 标题 — 来源（年份）
-[3] 标题 — 来源（年份）
+Evidence List:
+[1] Title — Source (Year)
+[2] Title — Source (Year)
+[3] Title — Source (Year)
 
-本工具仅供临床决策参考，不替代医师诊断与处方。
+This tool is for clinical decision reference only and does not replace physician diagnosis and prescription.
 """

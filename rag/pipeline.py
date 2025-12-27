@@ -39,7 +39,8 @@ def _env(key: str, default: str | None = None) -> str | None:
 # 延迟把重活交给 retriever（其中做了 lazy import & sqlite shim）
 # Defer heavy work to retriever (which lazy-imports chroma & patches sqlite)
 from . import retriever as R
-from .prompt import SYSTEM, USER_TEMPLATE  # 你的提示模板 / your prompt templates
+from . import prompt as prompt_en
+from . import prompt_cn as prompt_zh
 
 # -----------------------------------------------------------------------------
 # Config flags（Secrets 可覆盖）/ Config flags (overridable via Secrets)
@@ -76,7 +77,7 @@ def _render_with_citations(raw_text: str) -> str:
     """
     return raw_text or ""
 
-def _compose_user_prompt(question: str, drug_name: Optional[str], hits: List[Dict[str, Any]]) -> str:
+def _compose_user_prompt(question: str, drug_name: Optional[str], hits: List[Dict[str, Any]], lang: str) -> str:
     """
     组装用户提示词，把检索证据拼接到 USER_TEMPLATE 中。
     Compose the end-user prompt by inserting selected evidence into USER_TEMPLATE.
@@ -88,12 +89,16 @@ def _compose_user_prompt(question: str, drug_name: Optional[str], hits: List[Dic
         source = str(m.get("source") or m.get("source_filename") or "Unknown")
         year   = str(m.get("year")   or "—")
         content = str(h.get("content") or "")
-        # 每条证据用 markdown 小节，供模型引用
-        lines.append(f"### #{i} {title}\n- Source: {source} · Year: {year}\n\n{content}\n")
+        # Represent each evidence item as a Markdown section for citation.
+        if lang == "zh":
+            lines.append(f"### #{i} {title}\n- 来源: {source} · 年份: {year}\n\n{content}\n")
+        else:
+            lines.append(f"### #{i} {title}\n- Source: {source} · Year: {year}\n\n{content}\n")
 
     evidence_md = "\n".join(lines)
-    # USER_TEMPLATE 需包含 {question}/{drug}/{evidence_md} 占位符
-    return USER_TEMPLATE.format(question=question, drug=(drug_name or ""), evidence_md=evidence_md)
+    templates = prompt_zh if lang == "zh" else prompt_en
+    # USER_TEMPLATE should include {question}/{drug}/{evidence_md} placeholders.
+    return templates.USER_TEMPLATE.format(question=question, drug=(drug_name or ""), evidence_md=evidence_md)
 
 def _i18n(lang: str, key: str) -> str:
     """极简内置文案 i18n，仅覆盖 pipeline 生成的文本 / Minimal inline i18n for pipeline text."""
@@ -203,7 +208,8 @@ def answer(
         #    - 用户提示词：将证据以 markdown 小节拼接，要求模型在结论段落内显式插入 [1][2][3]… 引用
         if _openai_available() and hits:
             try:
-                user_prompt = _compose_user_prompt(question, drug_name, hits)
+                templates = prompt_zh if lang == "zh" else prompt_en
+                user_prompt = _compose_user_prompt(question, drug_name, hits, lang=lang)
 
                 # 追加一个清晰的“格式/引用”指令，确保会出现 [1][2][3] 这种编号
                 if lang == "zh":
@@ -220,8 +226,7 @@ def answer(
                     )
 
                 final_user = user_prompt + citation_hint
-                # SYSTEM 可按语言简单切换
-                sys_prompt = SYSTEM if lang == "zh" else (SYSTEM + "\nPlease answer in English.")
+                sys_prompt = templates.SYSTEM
 
                 llm_out = _openai_chat(system_prompt=sys_prompt, user_prompt=final_user)
 

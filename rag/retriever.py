@@ -102,6 +102,16 @@ CHROMA_COLLECTION  = os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2")
 EMBEDDING_MODEL    = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
 DRUG_DB_PATH       = _abs(os.getenv("DRUG_DB_PATH", "./db/drugs.sqlite"))
 
+if os.getenv("CAREMIND_DEBUG") == "1":
+    try:
+        _log("Loaded retriever from:", __file__)
+        _log("Env CHROMA_PERSIST_DIR:", os.getenv("CHROMA_PERSIST_DIR"))
+        _log("Effective CHROMA_PERSIST_DIR:", CHROMA_PERSIST_DIR)
+        _log("Effective CHROMA_COLLECTION:", CHROMA_COLLECTION)
+        _log("Effective DRUG_DB_PATH:", DRUG_DB_PATH)
+    except Exception:
+        pass
+
 VERSION = "retriever-2025-12-25"
 
 
@@ -439,6 +449,8 @@ def search_guidelines(query: str, k: int = 4) -> List[Dict[str, Any]]:
             embed_model=EMBEDDING_MODEL,
             persist_dir=CHROMA_PERSIST_DIR,
             )
+        if col is None:
+            return []
         res = col.query(
             query_texts=[q],
             n_results=max(1, int(k)),
