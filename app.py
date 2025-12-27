@@ -255,6 +255,10 @@ I18N: Dict[str, Dict[str, str]] = {
         "diag_chroma_err": "Chroma 访问错误：",
         "diag_sqlite": "SQLite 表：",
         "diag_sqlite_err": "SQLite 错误：",
+        "draft_reason_missing_key": "ℹ️ 进入草案模式：未检测到 OPENAI_API_KEY（请在 Streamlit Cloud → Manage app → Secrets 中配置）。",
+        "draft_reason_openai_error": "ℹ️ 进入草案模式：OpenAI 调用失败（{err}）。请查看 Cloud 日志。",
+        "draft_reason_no_hits": "ℹ️ 进入草案模式：未检索到证据片段，未调用 OpenAI。",
+        "draft_reason_demo": "ℹ️ 已进入演示模式：检索后端在当前环境不可用。",
     },
     "en": {
         "title": "CareMind · Clinical Decision Support (MVP)",
@@ -306,6 +310,10 @@ I18N: Dict[str, Dict[str, str]] = {
         "diag_chroma_err": "Chroma access error: ",
         "diag_sqlite": "SQLite tables:",
         "diag_sqlite_err": "SQLite error: ",
+        "draft_reason_missing_key": "ℹ️ Draft mode: OPENAI_API_KEY is not set (Streamlit Cloud → Manage app → Secrets).",
+        "draft_reason_openai_error": "ℹ️ Draft mode: OpenAI call failed ({err}). Check Cloud logs.",
+        "draft_reason_no_hits": "ℹ️ Draft mode: no evidence snippets were retrieved; OpenAI was not called.",
+        "draft_reason_demo": "ℹ️ Demo mode: retrieval backend is unavailable in this environment.",
     },
 }
 def t(lang: str, key: str) -> str:
@@ -453,6 +461,18 @@ if res:
     # --- 建议 ---
     with tab_adv:
         st.subheader(t(lang, "advice_hdr"))
+
+        mode = res.get("mode")
+        if mode == "draft":
+            if not res.get("openai_key_present"):
+                st.info(t(lang, "draft_reason_missing_key"))
+            elif res.get("openai_error_type"):
+                st.info(t(lang, "draft_reason_openai_error").format(err=res.get("openai_error_type")))
+            else:
+                st.info(t(lang, "draft_reason_no_hits"))
+        elif mode == "demo":
+            st.info(t(lang, "draft_reason_demo"))
+
         raw_out = res.get("output") or ""
         advice_md, evidence_list_md = split_advice_and_evidence_list(raw_out)
         advice_md = link_citations(advice_md)

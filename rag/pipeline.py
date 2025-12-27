@@ -207,9 +207,19 @@ def answer(
     """
     kk = _clamp_k(k)
 
+    # Expose why we might fall back to draft mode (used by Streamlit UI).
+    _load_dotenv_if_present()
+    openai_key_present: bool = bool(os.getenv("OPENAI_API_KEY"))
+    openai_attempted: bool = False
+    openai_error_type: Optional[str] = None
+    openai_reason: str = "missing_key" if not openai_key_present else ""
+
     try:
         # 1) 指南检索（由 retriever 处理 Chroma & sqlite 兼容）/ Guideline search
         hits: List[Dict[str, Any]] = R.search_guidelines(question, k=kk) or []
+
+        if openai_key_present and not hits:
+            openai_reason = "no_hits"
 
         # 2) 可选：结构化药品信息（SQLite）/ Optional structured drug info
         drug_struct = None
@@ -222,8 +232,9 @@ def answer(
         # 3) 优先尝试调用 OpenAI 生成“正式建议”
         #    - 系统提示词 SYSTEM，与 UI 语言一致
         #    - 用户提示词：将证据以 markdown 小节拼接，要求模型在结论段落内显式插入 [1][2][3]… 引用
-        if _openai_available() and hits:
+        if openai_key_present and hits:
             try:
+                openai_attempted = True
                 templates = prompt_zh if lang == "zh" else prompt_en
                 user_prompt = _compose_user_prompt(question, drug_name, hits, lang=lang)
 
@@ -248,13 +259,27 @@ def answer(
 
                 if llm_out and llm_out.strip():
                     # OpenAI 路径成功：直接返回模型产物
-                    return AnswerBundle(
+                    out = AnswerBundle(
                         output=_render_with_citations(llm_out),
                         guideline_hits=hits,
                         drug=drug_struct,
                     ).__dict__
-            except Exception:
+                    out.update(
+                        {
+                            "mode": "llm",
+                            "openai_key_present": openai_key_present,
+                            "openai_attempted": openai_attempted,
+                            "openai_error_type": openai_error_type,
+                            "openai_reason": "",
+                            "openai_model": (OPENAI_MODEL_DEFAULT or ""),
+                        }
+                    )
+                    return out
+            except Exception as e:
                 # 捕获 OpenAI 相关异常，进入草案回退；日志交给 Streamlit 端显示
+                openai_attempted = True
+                openai_error_type = type(e).__name__
+                openai_reason = "openai_error"
                 traceback.print_exc()
 
         # 4) 回退：用“草案建议”模板生成最小可用文本（保证 UI 不空）
@@ -303,11 +328,22 @@ def answer(
                 lines.append(f"Drug: {drug_name}")
             lines += ["", p1, p2, "", ev_list, "", f"{_i18n(lang, 'note')}" ]
 
-        return AnswerBundle(
+        out = AnswerBundle(
             output=_render_with_citations("\n".join(lines)),
             guideline_hits=hits,
             drug=drug_struct,
         ).__dict__
+        out.update(
+            {
+                "mode": "draft",
+                "openai_key_present": openai_key_present,
+                "openai_attempted": openai_attempted,
+                "openai_error_type": openai_error_type,
+                "openai_reason": openai_reason,
+                "openai_model": (OPENAI_MODEL_DEFAULT or ""),
+            }
+        )
+        return out
 
     except Exception:
         # DEMO 回退：在 Cloud 无后端依赖时，保持 UI 可用 / DEMO fallback to keep UI usable
@@ -333,7 +369,18 @@ def answer(
                 "",
                 f"_{_i18n(lang, 'note')}_",
             ]
-            return AnswerBundle(output="\n".join(lines), guideline_hits=hits, drug=None).__dict__
+            out = AnswerBundle(output="\n".join(lines), guideline_hits=hits, drug=None).__dict__
+            out.update(
+                {
+                    "mode": "demo",
+                    "openai_key_present": openai_key_present,
+                    "openai_attempted": False,
+                    "openai_error_type": None,
+                    "openai_reason": "demo_backend_error",
+                    "openai_model": (OPENAI_MODEL_DEFAULT or ""),
+                }
+            )
+            return out
 
         # 非演示模式则抛出，让日志显示真实错误 / Re-raise in non-demo mode
         raise
