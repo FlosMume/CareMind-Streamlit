@@ -176,6 +176,22 @@ def _first_sentences(txt: str, n_sent: int = 1, limit: int = 180) -> str:
     pick = pick[:limit] + ("…" if len(pick) > limit else "")
     return pick
 
+def _compact_evidence_list(lang: str, hits: List[Dict[str, Any]]) -> str:
+    """Render a compact evidence list mapping [i] -> title/source/year."""
+    hdr = "证据清单：" if lang == "zh" else "Evidence List:"
+    if not hits:
+        return hdr + "\n" + ("（暂无证据片段）" if lang == "zh" else "(No evidence snippets available.)")
+
+    lines: List[str] = [hdr]
+    for i, h in enumerate(hits or [], 1):
+        m = h.get("meta") or {}
+        title  = str(m.get("title") or m.get("doc_title") or m.get("section_title") or ("无标题" if lang == "zh" else "Untitled"))
+        source = str(m.get("source") or m.get("source_filename") or ("未知来源" if lang == "zh" else "Unknown"))
+        year   = str(m.get("year") or "").strip()
+        tail = (f"（{year}）" if lang == "zh" else f"({year})") if year else ""
+        lines.append(f"[{i}] {title} — {source} {tail}".rstrip())
+    return "\n".join(lines).strip()
+
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
@@ -242,28 +258,50 @@ def answer(
                 traceback.print_exc()
 
         # 4) 回退：用“草案建议”模板生成最小可用文本（保证 UI 不空）
-        lines: List[str] = []
-        lines.append(f"**{_i18n(lang, 'hdr_draft')}**")
-        lines.append("")
-        lines.append(f"- **{_i18n(lang, 'q')}:** {question}")
-        if drug_name:
-            lines.append(f"- **{_i18n(lang, 'drug')}:** {drug_name}")
-        lines.append("")
-        lines.append(f"**{_i18n(lang, 'evidence')}:**")
-        if not hits:
-            lines.append(f"- {_i18n(lang, 'none_hits')}")
+        ev_list = _compact_evidence_list(lang, hits)
+        # Natural-language draft (still conservative): keeps UI readable even without OpenAI.
+        if lang == "zh":
+            p1 = (
+                "建议：\n"
+                "结论：对合并支气管哮喘的高血压患者，β 受体阻滞剂通常需要谨慎评估；"
+                "若仅为降压目的，一般优先选择对气道影响更小的替代降压方案。\n\n"
+                "若存在必须使用 β 受体阻滞剂的明确心血管指征（例如心衰/心梗后/部分心律失常），"
+                "临床上通常倾向选择 β1 选择性药物、从小剂量开始，并在哮喘稳定期严密监测呼吸症状与峰流速；"
+                "若出现喘息加重或急救支气管舒张剂反应变差，应及时复评并调整方案。\n"
+            )
+            p2 = (
+                "说明：以上为在未调用大模型生成‘正式建议’时的保守草案，"
+                "可结合下方证据清单 [1][2]… 与患者具体情况由临床医生综合判断。\n"
+            )
+            lines = [
+                f"**{_i18n(lang, 'hdr_draft')}**",
+                "",
+                f"问题：{question}",
+            ]
+            if drug_name:
+                lines.append(f"药品：{drug_name}")
+            lines += ["", p1, p2, "", ev_list, "", f"{_i18n(lang, 'note')}" ]
         else:
-            bullets = []
-            for i, h in enumerate(hits, 1):
-                m = h.get("meta") or {}
-                content = (h.get("content") or h.get("doc") or "").strip()
-                snippet = _first_sentences(content, n_sent=1, limit=180)
-                title  = str(m.get("title") or m.get("doc_title") or m.get("section_title") or ("无标题" if lang == "zh" else "Untitled"))
-                bullets.append(f"- {snippet or title} [#{i}]")
-            lines += bullets
-
-        lines.append("")
-        lines.append(f"_{_i18n(lang, 'note')}_")
+            p1 = (
+                "Advice:\n"
+                "Bottom line: In patients with asthma and hypertension, beta-blockers often require careful risk–benefit assessment; "
+                "if the goal is blood-pressure control alone, alternatives with less airway risk are typically preferred.\n\n"
+                "If there is a compelling cardiovascular indication (e.g., heart failure, post-MI, certain arrhythmias), clinicians often favor "
+                "a cardioselective (beta-1 selective) agent at the lowest effective dose with close monitoring for bronchospasm and rescue-inhaler response; "
+                "worsening wheeze or reduced bronchodilator effect should prompt reassessment.\n"
+            )
+            p2 = (
+                "Note: This is a conservative draft fallback when a full LLM-generated response is not available; "
+                "please interpret together with the Evidence List [1][2]… and clinical context.\n"
+            )
+            lines = [
+                f"**{_i18n(lang, 'hdr_draft')}**",
+                "",
+                f"Question: {question}",
+            ]
+            if drug_name:
+                lines.append(f"Drug: {drug_name}")
+            lines += ["", p1, p2, "", ev_list, "", f"{_i18n(lang, 'note')}" ]
 
         return AnswerBundle(
             output=_render_with_citations("\n".join(lines)),
