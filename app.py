@@ -452,6 +452,51 @@ def t(lang: str, key: str) -> str:
 
 
 # =============================================================================
+# 2.5) UI helper: localize structured drug field names
+# ----------------------------------------------------------------------------
+
+_DRUG_FIELD_LABELS_ZH: Dict[str, str] = {
+    # Common/expected schema
+    "drug_name": "药品名称",
+    "name": "药品名称",
+    "generic_name": "通用名",
+    "brand_name": "商品名",
+    "pregnancy_category": "妊娠分级/用药建议",
+    "lactation": "哺乳期",
+    "indication": "适应症",
+    "contraindication": "禁忌症",
+    "warning": "警告/注意事项",
+    "dosage": "剂量",
+    "route": "给药途径",
+    "renal_adjustment": "肾功能剂量调整",
+    "hepatic_adjustment": "肝功能剂量调整",
+    "interactions": "相互作用",
+    "monitoring": "监测要点",
+    "notes": "备注",
+    "source": "来源",
+    "updated_at": "更新时间",
+    "created_at": "创建时间",
+    "id": "ID",
+}
+
+
+def localize_drug_record_for_ui(obj: Any, lang: str) -> Any:
+    """Localize keys in the structured drug payload for display purposes only."""
+    if lang != "zh":
+        return obj
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            kk = str(k)
+            label = _DRUG_FIELD_LABELS_ZH.get(kk, kk)
+            out[label] = localize_drug_record_for_ui(v, lang)
+        return out
+    if isinstance(obj, list):
+        return [localize_drug_record_for_ui(v, lang) for v in obj]
+    return obj
+
+
+# =============================================================================
 # 3) 轻量样式
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="CareMind · MVP CDSS", layout="wide", page_icon="💊")
@@ -739,7 +784,7 @@ if res:
     with tab_drug:
         st.subheader(t(lang, "drug_hdr"))
         if res.get("drug"):
-            st.json(res["drug"], expanded=False)
+            st.json(localize_drug_record_for_ui(res["drug"], lang), expanded=False)
         else:
             st.caption(t(lang, "no_drug"))
 
