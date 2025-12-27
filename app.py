@@ -181,6 +181,51 @@ def strip_evidence_list_heading_in_advice(md: str) -> str:
     return md.strip()
 
 
+def extract_drug_from_question(q: str) -> tuple[str, Optional[str]]:
+    """If user pasted a template into the question box, extract a trailing drug-name line.
+
+    Returns (clean_question, extracted_drug_or_None).
+    Conservative heuristic: only extracts the last non-empty line if it looks like a drug name.
+    """
+    txt = (q or "").strip("\n")
+    if not txt:
+        return "", None
+
+    raw_lines = [ln.strip() for ln in txt.splitlines()]
+    raw_lines = [ln for ln in raw_lines if ln]
+    if len(raw_lines) < 2:
+        return txt.strip(), None
+
+    # Drop common instruction lines seen in the pasted template.
+    def _is_instruction(line: str) -> bool:
+        s = line.strip()
+        return bool(
+            re.match(r"(?i)^\s*(\(\s*optional\s*\)|\（\s*可选\s*\）)", s)
+            or re.match(r"(?i)^\s*(medicine\s*\(optional\)|drug\s*name|drug)", s)
+            or re.match(r"(?i)^\s*(可选).*", s)
+            or re.match(r"(?i)^\s*(药品名称|药品)\s*\(?.*\)?\s*$", s)
+        )
+
+    lines = [ln for ln in raw_lines if not _is_instruction(ln)]
+    if len(lines) < 2:
+        return txt.strip(), None
+
+    last = lines[-1].strip()
+    # Heuristic for drug-name line.
+    if (
+        1 <= len(last) <= 40
+        and not re.search(r"[？?]", last)
+        and not re.search(r"^(?:http|www\.)", last, flags=re.I)
+        and not re.search(r"[。.!！]$", last)
+        and not re.search(r"\s{2,}", last)
+    ):
+        # Also avoid extracting if the last line looks like a full sentence.
+        if not re.search(r"[，,；;：:]", last):
+            return "\n".join(lines[:-1]).strip(), last
+
+    return "\n".join(lines).strip(), None
+
+
 def normalize_evidence_list_md(md: str, lang: str) -> str:
     """Normalize Evidence List: remove the visible header and render each [n] entry as one bullet line."""
     txt = (md or "").strip()
@@ -522,7 +567,8 @@ if submitted:
         with st.spinner("..."):
             try:
                 t0 = time.time()
-                # Users sometimes paste "药品名称：xxx" into the question box; strip such UI-label lines.
+                # Users sometimes paste a full template into the question box.
+                # 1) Strip explicit label lines like "药品名称：xxx".
                 q_clean = "\n".join(
                     [
                         ln
@@ -530,14 +576,21 @@ if submitted:
                         if not re.match(r"(?i)^\s*(药品名称|药品|drug\s*name|drug)\s*[:：]", ln.strip())
                     ]
                 ).strip()
+
+                # 2) If the dedicated drug input is empty, try extracting a trailing drug-name line.
+                extracted_drug: Optional[str] = None
+                if not (drug or "").strip():
+                    q_clean, extracted_drug = extract_drug_from_question(q_clean)
+
+                drug_effective = (drug or "").strip() or (extracted_drug or "").strip() or None
                 sig_params = inspect.signature(cm_pipeline.answer).parameters
                 if "lang" in sig_params:
                     res = cm_pipeline.answer(
-                        q_clean, drug_name=(drug.strip() or None), k=int(k), lang=lang
+                        q_clean, drug_name=drug_effective, k=int(k), lang=lang
                     )
                 else:
                     res = cm_pipeline.answer(
-                        q_clean, drug_name=(drug.strip() or None), k=int(k)
+                        q_clean, drug_name=drug_effective, k=int(k)
                     )
                 elapsed = time.time() - t0
 
@@ -550,7 +603,7 @@ if submitted:
 
                 # 记录到会话历史
                 st.session_state.setdefault("cm_history", []).append(
-                    {"q": q.strip(), "drug": (drug.strip() or None), "k": int(k), "time": time.time()}
+                    {"q": q.strip(), "drug": drug_effective, "k": int(k), "time": time.time()}
                 )
             except Exception as e:
                 st.error(t(lang, "err_backend"))

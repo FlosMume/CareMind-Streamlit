@@ -84,8 +84,20 @@ def _log(*msg: Any) -> None:
     print(f"[{ts}] retriever:", *msg, flush=True)
 
 def _abs(p: str) -> str:
-    """Expand ~ and make path absolute to avoid CWD/hot-reload ambiguity."""
-    return os.path.abspath(os.path.expanduser(p))
+    """Expand ~ and make path absolute.
+
+    If a relative path is provided, resolve it against the repo root
+    (where app.py lives), not the current working directory, to avoid
+    ambiguity across Streamlit reloads / different launch contexts.
+    """
+    p = os.path.expanduser(p)
+    try:
+        pp = Path(p)
+        if pp.is_absolute():
+            return str(pp)
+        return str((_PROJECT_ROOT / pp).resolve())
+    except Exception:
+        return os.path.abspath(p)
 
 
 # =============================================================================
@@ -563,24 +575,38 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         cur = con.cursor()
-        # Support both Chinese/English input by searching both 'name' and 'generic_name' when present.
-        # Keep it defensive: if a column doesn't exist, fall back to name-only.
+        # Support both v2 schema (drug_name/pregnancy_category) and legacy schema (name/generic_name/pregnancy).
+        cols = set()
         try:
+            cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(drugs);").fetchall()}
+        except Exception:
+            cols = set()
+
+        name_col = "drug_name" if "drug_name" in cols else ("name" if "name" in cols else None)
+        generic_col = "generic_name" if "generic_name" in cols else None
+
+        if not name_col:
+            return None
+
+        if generic_col:
             cur.execute(
-                "SELECT * FROM drugs WHERE (name LIKE ? OR generic_name LIKE ?) ORDER BY name LIMIT 1",
+                f"SELECT * FROM drugs WHERE ({name_col} LIKE ? OR {generic_col} LIKE ?) ORDER BY {name_col} LIMIT 1",
                 (f"%{key}%", f"%{key}%"),
             )
-        except Exception:
-            cur.execute("SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{key}%",))
+        else:
+            cur.execute(
+                f"SELECT * FROM drugs WHERE {name_col} LIKE ? ORDER BY {name_col} LIMIT 1",
+                (f"%{key}%",),
+            )
         row = cur.fetchone()
         if not row:
             return None
         name_val = None
         try:
-            if "name" in row.keys():
-                name_val = row["name"]
-            elif "drug_name" in row.keys():
+            if "drug_name" in row.keys():
                 name_val = row["drug_name"]
+            elif "name" in row.keys():
+                name_val = row["name"]
         except Exception:
             name_val = None
         return {"name": str(name_val or key), "row": dict(row)}

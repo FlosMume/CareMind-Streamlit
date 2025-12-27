@@ -131,6 +131,8 @@ COLUMN_MAP: Dict[str, str] = {
     "妊娠分级": "pregnancy_category",
     "妊娠分类": "pregnancy_category",
     "妊娠用药分级": "pregnancy_category",
+    # Some sheets use a combined header like "妊娠分级/用药建议" (snake() -> 妊娠分级_用药建议)
+    "妊娠分级_用药建议": "pregnancy_category",
     "pregnancy": "pregnancy_category",
     "pregnancy_category": "pregnancy_category",
     "pregnancy category": "pregnancy_category",
@@ -204,6 +206,29 @@ def create_schema(con: sqlite3.Connection) -> None:
     )
 
 
+def _existing_columns(con: sqlite3.Connection, table: str = "drugs") -> set[str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table});").fetchall()
+        return {str(r[1]) for r in rows}  # (cid, name, type, notnull, dflt, pk)
+    except Exception:
+        return set()
+
+
+def _detect_drugs_schema(con: sqlite3.Connection) -> str:
+    """Detect which drugs schema we are writing into.
+
+    - v2: columns include 'drug_name' and 'pregnancy_category' (this script's default)
+    - legacy: columns include 'name' and 'pregnancy' (older DB shipped with the repo)
+    """
+    cols = _existing_columns(con, "drugs")
+    if "drug_name" in cols:
+        return "v2"
+    if "name" in cols:
+        return "legacy"
+    # No drugs table yet (or unexpected): create v2 by default.
+    return "v2"
+
+
 def create_fts(con: sqlite3.Connection) -> None:
     # Requires SQLite built with FTS5 (standard in modern SQLite)
     con.executescript(
@@ -236,6 +261,48 @@ def create_fts(con: sqlite3.Connection) -> None:
         """
     )
 
+
+def create_fts_legacy(con: sqlite3.Connection) -> None:
+    """FTS for legacy schema (name/generic_name/pregnancy)."""
+    # If a previous run created an incompatible drugs_fts schema, drop and recreate.
+    # (SQLite FTS tables can't be ALTERed easily; recreate is simplest and safe.)
+    con.executescript(
+        """
+        DROP TRIGGER IF EXISTS drugs_ai;
+        DROP TRIGGER IF EXISTS drugs_ad;
+        DROP TRIGGER IF EXISTS drugs_au;
+        DROP TABLE IF EXISTS drugs_fts;
+        """
+    )
+    con.executescript(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS drugs_fts USING fts5(
+            name, generic_name, indications, contraindications, interactions, pregnancy, source,
+            content='drugs', content_rowid='id'
+        );
+
+        -- Initial sync
+        INSERT INTO drugs_fts(rowid, name, generic_name, indications, contraindications, interactions, pregnancy, source)
+        SELECT id, name, generic_name, indications, contraindications, interactions, pregnancy, source FROM drugs
+        WHERE NOT EXISTS (SELECT 1 FROM drugs_fts LIMIT 1);
+
+        CREATE TRIGGER IF NOT EXISTS drugs_ai AFTER INSERT ON drugs BEGIN
+            INSERT INTO drugs_fts(rowid, name, generic_name, indications, contraindications, interactions, pregnancy, source)
+            VALUES (new.id, new.name, new.generic_name, new.indications, new.contraindications, new.interactions, new.pregnancy, new.source);
+        END;
+        CREATE TRIGGER IF NOT EXISTS drugs_ad AFTER DELETE ON drugs BEGIN
+            INSERT INTO drugs_fts(drugs_fts, rowid, name, generic_name, indications, contraindications, interactions, pregnancy, source)
+            VALUES ('delete', old.id, old.name, old.generic_name, old.indications, old.contraindications, old.interactions, old.pregnancy, old.source);
+        END;
+        CREATE TRIGGER IF NOT EXISTS drugs_au AFTER UPDATE ON drugs BEGIN
+            INSERT INTO drugs_fts(drugs_fts, rowid, name, generic_name, indications, contraindications, interactions, pregnancy, source)
+            VALUES ('delete', old.id, old.name, old.generic_name, old.indications, old.contraindications, old.interactions, old.pregnancy, old.source);
+            INSERT INTO drugs_fts(rowid, name, generic_name, indications, contraindications, interactions, pregnancy, source)
+            VALUES (new.id, new.name, new.generic_name, new.indications, new.contraindications, new.interactions, new.pregnancy, new.source);
+        END;
+        """
+    )
+
 # -----------------------------
 # Insertion logic
 # -----------------------------
@@ -261,6 +328,54 @@ def upsert_row(con: sqlite3.Connection, row: dict) -> None:
             pregnancy_category = COALESCE(excluded.pregnancy_category, drugs.pregnancy_category),
             source = COALESCE(excluded.source, drugs.source),
             updated_at = CURRENT_TIMESTAMP;
+        """,
+        params,
+    )
+
+
+def upsert_row_legacy(con: sqlite3.Connection, row: dict) -> None:
+    """Upsert into legacy schema where the primary text key is 'name'.
+
+    Legacy table shape (as shipped in this repo at times):
+      drugs(id, name, generic_name, indications, contraindications, interactions, pregnancy, source)
+    """
+    name = str(row.get("drug_name") or "").strip()
+    if not name:
+        raise ValueError("Missing required drug name")
+
+    # Map modern field names to legacy columns
+    params = {
+        "name": name,
+        "generic_name": str(row.get("generic_name") or "").strip() or None,
+        "indications": None if pd.isna(row.get("indications")) else str(row.get("indications") or "").strip() or None,
+        "contraindications": None if pd.isna(row.get("contraindications")) else str(row.get("contraindications") or "").strip() or None,
+        "interactions": None if pd.isna(row.get("interactions")) else str(row.get("interactions") or "").strip() or None,
+        # Excel may provide pregnancy_category; store into legacy 'pregnancy'
+        "pregnancy": None if pd.isna(row.get("pregnancy_category")) else str(row.get("pregnancy_category") or "").strip() or None,
+        "source": None if pd.isna(row.get("source")) else str(row.get("source") or "").strip() or None,
+    }
+
+    # Try update first, then insert if missing.
+    cur = con.execute(
+        """
+        UPDATE drugs SET
+            generic_name = COALESCE(:generic_name, generic_name),
+            indications = COALESCE(:indications, indications),
+            contraindications = COALESCE(:contraindications, contraindications),
+            interactions = COALESCE(:interactions, interactions),
+            pregnancy = COALESCE(:pregnancy, pregnancy),
+            source = COALESCE(:source, source)
+        WHERE name = :name;
+        """,
+        params,
+    )
+    if cur.rowcount and cur.rowcount > 0:
+        return
+
+    con.execute(
+        """
+        INSERT INTO drugs (name, generic_name, indications, contraindications, interactions, pregnancy, source)
+        VALUES (:name, :generic_name, :indications, :contraindications, :interactions, :pregnancy, :source);
         """,
         params,
     )
@@ -305,19 +420,32 @@ def ingest_excel(cfg: IngestConfig) -> Tuple[int, int]:
 
     # Ingest rows, Connect DB and create schema
     con = connect(out_path)
-    create_schema(con)
-    if cfg.with_fts:
-        create_fts(con)
+
+    schema = _detect_drugs_schema(con)
+    if schema == "v2":
+        create_schema(con)
+        if cfg.with_fts:
+            create_fts(con)
+    else:
+        # Legacy DB exists; do not rewrite schema, just add FTS/index when requested.
+        if cfg.with_fts:
+            create_fts_legacy(con)
 
     # Upsert rows
     inserted = 0
     for _, r in df.iterrows():
-        upsert_row(con, r.to_dict())
+        if schema == "v2":
+            upsert_row(con, r.to_dict())
+        else:
+            upsert_row_legacy(con, r.to_dict())
         inserted += 1
     con.commit()
 
     # Basic indices, Add index for faster lookup
-    con.execute("CREATE INDEX IF NOT EXISTS idx_drugs_drug_name ON drugs(drug_name);")
+    if schema == "v2":
+        con.execute("CREATE INDEX IF NOT EXISTS idx_drugs_drug_name ON drugs(drug_name);")
+    else:
+        con.execute("CREATE INDEX IF NOT EXISTS idx_drugs_name ON drugs(name);")
     con.commit()
     con.close()
 
