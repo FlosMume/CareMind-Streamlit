@@ -229,6 +229,9 @@ I18N: Dict[str, Dict[str, str]] = {
         "preset2": "老年合并 T2DM+CAD：降压目标与方案",
         "preset3": "GDM 胰岛素起始（指征与剂量）",
         "advice_hdr": "建议（含引用与合规声明）",
+        "advice_hdr_llm": "建议（含引用与合规声明）",
+        "advice_hdr_draft": "临床建议（草案）",
+        "advice_hdr_demo": "演示输出",
         "time_used": "⏱️ 用时：{:.2f}s",
         "export_advice": "导出建议（Markdown）",
         "export_evidence": "导出证据（Markdown）",
@@ -284,6 +287,9 @@ I18N: Dict[str, Dict[str, str]] = {
         "preset2": "Elderly with T2DM+CAD: target BP and first-line therapy",
         "preset3": "GDM: when to start insulin",
         "advice_hdr": "Advice (with citations & compliance note)",
+        "advice_hdr_llm": "Advice (with citations & compliance statement)",
+        "advice_hdr_draft": "Clinical Advice (Draft)",
+        "advice_hdr_demo": "Demo Output",
         "time_used": "⏱️ Elapsed: {:.2f}s",
         "export_advice": "Export Advice (Markdown)",
         "export_evidence": "Export Evidence (Markdown)",
@@ -460,9 +466,16 @@ if submitted:
 if res:
     # --- 建议 ---
     with tab_adv:
-        st.subheader(t(lang, "advice_hdr"))
-
         mode = res.get("mode")
+        hdr_key = "advice_hdr"
+        if mode == "draft":
+            hdr_key = "advice_hdr_draft"
+        elif mode == "demo":
+            hdr_key = "advice_hdr_demo"
+        elif mode == "llm":
+            hdr_key = "advice_hdr_llm"
+
+        st.subheader(t(lang, hdr_key))
         if mode == "draft":
             if not res.get("openai_key_present"):
                 st.info(t(lang, "draft_reason_missing_key"))
