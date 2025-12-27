@@ -299,8 +299,6 @@ def answer(
                 "可结合下方证据清单 [1][2]… 与患者具体情况由临床医生综合判断。\n"
             )
             lines = [
-                f"**{_i18n(lang, 'hdr_draft')}**",
-                "",
                 f"问题：{question}",
             ]
             if drug_name:
@@ -320,8 +318,6 @@ def answer(
                 "please interpret together with the Evidence List [1][2]… and clinical context.\n"
             )
             lines = [
-                f"**{_i18n(lang, 'hdr_draft')}**",
-                "",
                 f"Question: {question}",
             ]
             if drug_name:
