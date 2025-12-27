@@ -544,6 +544,13 @@ if submitted:
                     )
                 elapsed = time.time() - t0
 
+                # Store last retrieval stats for diagnostics.
+                try:
+                    st.session_state["cm_last_question"] = q_clean
+                    st.session_state["cm_last_hit_count"] = len(res.get("guideline_hits") or [])
+                except Exception:
+                    pass
+
                 # 记录到会话历史
                 st.session_state.setdefault("cm_history", []).append(
                     {"q": q.strip(), "drug": (drug.strip() or None), "k": int(k), "time": time.time()}
@@ -746,6 +753,33 @@ def render_diagnostics(lang: str = "zh") -> None:
             st.markdown(f"**Chunks in active collection (`{os.getenv('CHROMA_COLLECTION')}`)**: `{count}`")
         except Exception:
             st.markdown("**Chunks in active collection**: `-`")
+
+        # If the last query got 0 hits, show an actionable hint.
+        last_hits = st.session_state.get("cm_last_hit_count", None)
+        if last_hits == 0:
+            q_last = (st.session_state.get("cm_last_question") or "").strip()
+            if lang == "zh":
+                msg = (
+                    "本次检索命中为 0，因此‘证据清单’与‘药品结构化’可能为空。\n\n"
+                    "建议排查：\n"
+                    "- CHROMA_PERSIST_DIR 指向的目录在 Cloud 中是否存在且包含索引文件\n"
+                    "- CHROMA_COLLECTION 名称是否正确，且集合内是否有向量（上方 chunks > 0）\n"
+                    "- 若尚未构建索引：先在本地运行 ingest/build_vectors.py 生成向量库，并确保 Cloud 可访问该目录"
+                )
+                if q_last:
+                    msg += f"\n\n最近一次问题：{q_last}"
+                st.warning(msg)
+            else:
+                msg = (
+                    "The last retrieval returned 0 hits, so the Evidence List / Drug sections may be empty.\n\n"
+                    "Checks:\n"
+                    "- Does CHROMA_PERSIST_DIR exist on Cloud and contain the index files?\n"
+                    "- Is CHROMA_COLLECTION correct and does it contain vectors (chunks > 0 above)?\n"
+                    "- If you haven't built the index yet, run ingest/build_vectors.py locally and make the index available to Cloud"
+                )
+                if q_last:
+                    msg += f"\n\nLast question: {q_last}"
+                st.warning(msg)
 
         # SQLite 存在性与表
         db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
