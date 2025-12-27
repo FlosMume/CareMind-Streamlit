@@ -91,9 +91,9 @@ def _compose_user_prompt(question: str, drug_name: Optional[str], hits: List[Dic
         content = str(h.get("content") or "")
         # Represent each evidence item as a Markdown section for citation.
         if lang == "zh":
-            lines.append(f"### #{i} {title}\n- 来源: {source} · 年份: {year}\n\n{content}\n")
+            lines.append(f"### [{i}] {title}\n- 来源: {source} · 年份: {year}\n\n{content}\n")
         else:
-            lines.append(f"### #{i} {title}\n- Source: {source} · Year: {year}\n\n{content}\n")
+            lines.append(f"### [{i}] {title}\n- Source: {source} · Year: {year}\n\n{content}\n")
 
     evidence_md = "\n".join(lines)
     templates = prompt_zh if lang == "zh" else prompt_en
@@ -242,13 +242,13 @@ def answer(
                 if lang == "zh":
                     citation_hint = (
                         "\n\n请在结论/建议段落中使用形如 [1][2][3] 的文内引用，"
-                        "编号与上方证据小节的 #1/#2/#3 对应；不要产生不存在的编号。"
+                        "编号与上方证据小节的 [1]/[2]/[3] 对应；不要产生不存在的编号。"
                         "请输出 Markdown。"
                     )
                 else:
                     citation_hint = (
                         "\n\nIn your conclusion/recommendation paragraphs, include in-text citations "
-                        "like [1][2][3], where the numbers refer to the evidence sections (#1, #2, #3) above. "
+                        "like [1][2][3], where the numbers refer to the evidence sections ([1], [2], [3]) above. "
                         "Do not invent citations. Output Markdown."
                     )
 

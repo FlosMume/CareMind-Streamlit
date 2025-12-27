@@ -197,6 +197,7 @@ def normalize_evidence_list_md(md: str, lang: str) -> str:
     header_line = hdr
     items: List[str] = []
     current: Optional[str] = None
+    extras: List[str] = []
     for ln in lines:
         if not ln.strip():
             continue
@@ -210,10 +211,15 @@ def normalize_evidence_list_md(md: str, lang: str) -> str:
         else:
             if current:
                 current = (current + " " + ln.strip()).strip()
+            else:
+                extras.append(ln.strip())
     if current:
         items.append(current.strip())
 
     if not items:
+        # Preserve non-item informational lines (e.g. "暂无证据片段")
+        if extras:
+            return (header_line + "\n" + "\n".join(extras)).strip() + "\n"
         return header_line
     return (header_line + "\n" + "\n".join(items)).strip() + "\n"
 
@@ -519,14 +525,22 @@ if submitted:
         with st.spinner("..."):
             try:
                 t0 = time.time()
+                # Users sometimes paste "药品名称：xxx" into the question box; strip such UI-label lines.
+                q_clean = "\n".join(
+                    [
+                        ln
+                        for ln in (q or "").splitlines()
+                        if not re.match(r"(?i)^\s*(药品名称|药品|drug\s*name|drug)\s*[:：]", ln.strip())
+                    ]
+                ).strip()
                 sig_params = inspect.signature(cm_pipeline.answer).parameters
                 if "lang" in sig_params:
                     res = cm_pipeline.answer(
-                        q.strip(), drug_name=(drug.strip() or None), k=int(k), lang=lang
+                        q_clean, drug_name=(drug.strip() or None), k=int(k), lang=lang
                     )
                 else:
                     res = cm_pipeline.answer(
-                        q.strip(), drug_name=(drug.strip() or None), k=int(k)
+                        q_clean, drug_name=(drug.strip() or None), k=int(k)
                     )
                 elapsed = time.time() - t0
 
