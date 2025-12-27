@@ -563,11 +563,27 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         cur = con.cursor()
-        cur.execute("SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{key}%",))
+        # Support both Chinese/English input by searching both 'name' and 'generic_name' when present.
+        # Keep it defensive: if a column doesn't exist, fall back to name-only.
+        try:
+            cur.execute(
+                "SELECT * FROM drugs WHERE (name LIKE ? OR generic_name LIKE ?) ORDER BY name LIMIT 1",
+                (f"%{key}%", f"%{key}%"),
+            )
+        except Exception:
+            cur.execute("SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{key}%",))
         row = cur.fetchone()
         if not row:
             return None
-        return {"name": row["name"] if "name" in row.keys() else key, "row": dict(row)}
+        name_val = None
+        try:
+            if "name" in row.keys():
+                name_val = row["name"]
+            elif "drug_name" in row.keys():
+                name_val = row["drug_name"]
+        except Exception:
+            name_val = None
+        return {"name": str(name_val or key), "row": dict(row)}
     finally:
         with contextlib.suppress(Exception):
             con.close()

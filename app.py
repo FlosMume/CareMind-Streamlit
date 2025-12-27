@@ -168,72 +168,65 @@ def strip_redundant_advice_heading(md: str, lang: str) -> str:
     return "\n".join(lines).lstrip()
 
 
+def strip_evidence_list_heading_in_advice(md: str) -> str:
+    """Remove stray Evidence List headings that occasionally leak into the advice body."""
+    if not md:
+        return md
+    # Remove standalone header lines like "证据清单：" / "Evidence List:" (including bold wrappers)
+    md = re.sub(
+        r"(?mi)^\s*(?:\*\*|__)?\s*(evidence\s+list|证据清单)\s*(?:\*\*|__)?\s*[:：]?\s*$\n?",
+        "",
+        md,
+    )
+    return md.strip()
+
+
 def normalize_evidence_list_md(md: str, lang: str) -> str:
-    """Normalize Evidence List: keep a single header and render each [n] entry as one line."""
+    """Normalize Evidence List: remove the visible header and render each [n] entry as one bullet line."""
     txt = (md or "").strip()
     if not txt:
         return txt
 
-    hdr = "证据清单：" if lang == "zh" else "Evidence List:"
-    # Ensure header exists
-    if re.match(r"(?m)^\s*\[1\]\s+", txt) and not re.search(
-        r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]", txt
-    ):
-        txt = hdr + "\n" + txt
+    # Strip any explicit header lines; the tab title already says “证据清单 / Evidence List”.
+    txt = re.sub(
+        r"(?mi)^\s*(?:\*\*|__)?\s*(evidence\s+list|证据清单)\s*(?:\*\*|__)?\s*[:：]?\s*$",
+        "",
+        txt,
+    ).strip()
 
-    lines = [ln.rstrip() for ln in txt.splitlines()]
-    # Remove duplicate headers, keep the first one.
-    out_lines: List[str] = []
-    header_seen = False
-    for ln in lines:
-        if re.match(r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]\s*$", ln.strip()):
-            if header_seen:
-                continue
-            header_seen = True
-            out_lines.append(hdr)
-        else:
-            out_lines.append(ln)
-    lines = out_lines
-
-    # Collapse multi-line items into one line per [n]
-    header_line = hdr
+    # Extract items even if the model puts multiple entries on one line.
+    matches = list(re.finditer(r"\[(\d+)\]\s+", txt))
     items: List[str] = []
-    current: Optional[str] = None
-    extras: List[str] = []
-    for ln in lines:
-        if not ln.strip():
-            continue
-        if re.match(r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]", ln.strip()):
-            header_line = hdr
-            continue
-        if re.match(r"^\s*(?:[-*]\s*)?\[\d+\]\s+", ln):
-            if current:
-                items.append(current.strip())
-            current = re.sub(r"^\s*[-*]\s*", "", ln).strip()
-        else:
-            if current:
-                current = (current + " " + ln.strip()).strip()
-            else:
-                extras.append(ln.strip())
-    if current:
-        items.append(current.strip())
+    if matches:
+        for idx, m in enumerate(matches):
+            start = m.start()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(txt)
+            chunk = txt[start:end].strip()
+            chunk = re.sub(r"^\s*[-*]\s*", "", chunk).strip()
+            chunk = re.sub(r"\s+", " ", chunk).strip()
+            if chunk:
+                items.append(chunk)
+    else:
+        # Fallback: treat each non-empty line as an item.
+        for ln in txt.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            ln = re.sub(r"^\s*[-*]\s*", "", ln).strip()
+            items.append(re.sub(r"\s+", " ", ln).strip())
 
     if not items:
-        # Preserve non-item informational lines (e.g. "暂无证据片段")
-        if extras:
-            return (header_line + "\n" + "\n".join(extras)).strip() + "\n"
-        return header_line
-    # Render as a Markdown bullet list so each entry is one line in Streamlit.
-    items = [f"- {it}" for it in items]
-    return (header_line + "\n" + "\n".join(items)).strip() + "\n"
+        return "（暂无证据片段）" if lang == "zh" else "(No evidence snippets available.)"
+
+    # Render as Markdown bullets so Streamlit guarantees one item per line.
+    return "\n".join([f"- {it}" for it in items]).strip() + "\n"
 
 def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
     """Render a compact Evidence List (title/source/year only) from retrieved hits."""
-    hdr = "证据清单：" if lang == "zh" else "Evidence List:"
     if not hits:
-        return hdr + "\n" + ("（暂无证据片段）" if lang == "zh" else "(No evidence snippets available.)")
+        return "（暂无证据片段）" if lang == "zh" else "(No evidence snippets available.)"
 
-    lines = [hdr]
+    lines: List[str] = []
     for i, h in enumerate(hits or [], 1):
         m = h.get("meta") or {}
         title = (m.get("title") or m.get("doc_title") or m.get("section_title") or ("无标题" if lang == "zh" else "Untitled"))
@@ -599,6 +592,7 @@ if res:
         advice_md = link_citations(advice_md)
         evidence_list_md = link_citations(evidence_list_md)
         advice_md = strip_redundant_advice_heading(advice_md, lang)
+        advice_md = strip_evidence_list_heading_in_advice(advice_md)
 
         # Render only the advice section inside the Advice tab.
         st.markdown(advice_md, unsafe_allow_html=False)
