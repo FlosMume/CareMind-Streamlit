@@ -98,7 +98,8 @@ def _env(key: str, default: str | None = None) -> str | None:
 
 def link_citations(md: str) -> str:
     """把 "[#3]" / "[3]" 转为 "#hit-3" 锚点链接，便于从建议跳回证据片段。"""
-    return re.sub(r"\[(?:#)?(\d+)\]", r"[\1](#hit-\1)", md or "")
+    # Keep the visible text as "[n]" (not just "n") so users can see bracketed citations.
+    return re.sub(r"\[(?:#)?(\d+)\]", r"[[\1]](#hit-\1)", md or "")
 
 def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
     """Split model output into (advice_md, evidence_list_md).
@@ -204,10 +205,10 @@ def normalize_evidence_list_md(md: str, lang: str) -> str:
         if re.match(r"(?mi)^\s*(evidence\s+list|证据清单)\s*[:：]", ln.strip()):
             header_line = hdr
             continue
-        if re.match(r"^\s*\[\d+\]\s+", ln):
+        if re.match(r"^\s*(?:[-*]\s*)?\[\d+\]\s+", ln):
             if current:
                 items.append(current.strip())
-            current = ln.strip()
+            current = re.sub(r"^\s*[-*]\s*", "", ln).strip()
         else:
             if current:
                 current = (current + " " + ln.strip()).strip()
@@ -221,6 +222,8 @@ def normalize_evidence_list_md(md: str, lang: str) -> str:
         if extras:
             return (header_line + "\n" + "\n".join(extras)).strip() + "\n"
         return header_line
+    # Render as a Markdown bullet list so each entry is one line in Streamlit.
+    items = [f"- {it}" for it in items]
     return (header_line + "\n" + "\n".join(items)).strip() + "\n"
 
 def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
@@ -237,7 +240,7 @@ def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
         year = (m.get("year") or "")
         yr = f"{year}".strip()
         tail = (f"（{yr}）" if lang == "zh" else f"({yr})") if yr else ""
-        lines.append(f"[{i}] {title} — {source} {tail}".rstrip())
+        lines.append(f"- [{i}] {title} — {source} {tail}".rstrip())
     return "\n".join(lines).strip() + "\n"
 
 def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
