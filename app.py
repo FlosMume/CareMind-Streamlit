@@ -362,6 +362,43 @@ def localize_source_names_in_text(md: str, lang: str) -> str:
         out = out.replace(re.sub(r"\s+", "", zh_main_no_year), en_noext)
     return out
 
+
+def strip_mixed_zh_suffix_in_en_line(s: str, lang: str) -> str:
+    """Drop trailing Chinese organization suffixes in English UI (best-effort; UI/export only)."""
+    txt = str(s or "")
+    if lang != "en" or not txt.strip():
+        return txt
+
+    # Only apply when the line is mixed (has both Latin and CJK), so we don't destroy pure-Chinese titles.
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", txt))
+    has_latin = bool(re.search(r"[A-Za-z]", txt))
+    if not (has_cjk and has_latin):
+        return txt
+
+    # Preserve a trailing year like "(2024)" / "（2024）".
+    m = re.search(r"\s*([（(]\s*20\d{2}\s*[)）])\s*$", txt)
+    year_suffix = m.group(1) if m else ""
+    core = txt[: m.start()] if m else txt
+
+    # If the suffix after a dash is Chinese, drop it (e.g. "... — 中国XXX").
+    core = re.sub(r"\s*[—-]\s*[\u4e00-\u9fff].*$", "", core).rstrip()
+    # Also drop a trailing parenthetical Chinese suffix (rare), while keeping the year separately.
+    core = re.sub(r"\s*[（(][\u4e00-\u9fff][^）)]*[)）]\s*$", "", core).rstrip()
+
+    if year_suffix:
+        return (core + " " + year_suffix).rstrip()
+    return core
+
+
+def strip_mixed_zh_suffix_in_en_text(md: str, lang: str) -> str:
+    """Apply strip_mixed_zh_suffix_in_en_line line-by-line for Markdown blocks."""
+    if lang != "en":
+        return md
+    out_lines: List[str] = []
+    for ln in (md or "").splitlines():
+        out_lines.append(strip_mixed_zh_suffix_in_en_line(ln, lang))
+    return "\n".join(out_lines)
+
 def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
     """Render a compact Evidence List (title/source/year only) from retrieved hits."""
     if not hits:
@@ -374,6 +411,10 @@ def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
         source = (m.get("source") or m.get("source_filename") or ("未知来源" if lang == "zh" else "Unknown"))
         title = localize_doc_label(title, lang)
         source = localize_doc_label(source, lang)
+        title = strip_mixed_zh_suffix_in_en_line(title, lang)
+        source = strip_mixed_zh_suffix_in_en_line(source, lang)
+        title = strip_mixed_zh_suffix_in_en_line(title, lang)
+        source = strip_mixed_zh_suffix_in_en_line(source, lang)
         year = (m.get("year") or "")
         yr = f"{year}".strip()
         tail = (f"（{yr}）" if lang == "zh" else f"({yr})") if yr else ""
@@ -897,6 +938,11 @@ if res:
         advice_md = strip_redundant_advice_heading(advice_md, lang)
         advice_md = strip_evidence_list_heading_in_advice(advice_md)
 
+        advice_export_md = advice_md
+        if lang == "en":
+            advice_export_md = localize_source_names_in_text(advice_export_md, lang)
+            advice_export_md = strip_mixed_zh_suffix_in_en_text(advice_export_md, lang)
+
         # Render only the advice section inside the Advice tab.
         st.markdown(advice_md, unsafe_allow_html=False)
         if elapsed is not None:
@@ -908,11 +954,11 @@ if res:
         with b1:
             st.download_button(
                 t(lang, "export_advice"),
-                data=(advice_md or "").encode("utf-8"),
+                data=(advice_export_md or "").encode("utf-8"),
                 file_name="caremind_advice.md",
                 mime="text/markdown",
                 use_container_width=True,
-                disabled=not bool((advice_md or "").strip()),
+                disabled=not bool((advice_export_md or "").strip()),
             )
         with b2:
             st.download_button(
@@ -932,6 +978,7 @@ if res:
         hits_for_list: List[Dict[str, Any]] = res.get("guideline_hits") or []
         ev_list = evidence_list_md.strip() if evidence_list_md.strip() else evidence_list_md_from_hits(lang, hits_for_list)
         ev_list = localize_source_names_in_text(ev_list, lang)
+        ev_list = strip_mixed_zh_suffix_in_en_text(ev_list, lang)
         ev_list = link_citations(ev_list)
         ev_list = normalize_evidence_list_md(ev_list, lang)
         st.markdown(ev_list, unsafe_allow_html=False)
