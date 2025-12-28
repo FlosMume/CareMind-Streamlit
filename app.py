@@ -281,14 +281,32 @@ def localize_doc_label(text: str, lang: str) -> str:
     if not s or lang != "en":
         return s
 
+    def _strip_pure_year_suffix_en(x: str) -> str:
+        # Avoid duplicate "(2020) (2020)" when year is also appended separately.
+        return re.sub(r"\s*\(\s*20\d{2}\s*\)\s*$", "", (x or "").strip())
+
     # Exact filename/path mapping
     mapped = localize_source_name(s, lang)
     if mapped != s:
-        return os.path.splitext(mapped)[0]
+        return _strip_pure_year_suffix_en(os.path.splitext(mapped)[0])
 
     norm = _norm_doc_label(s)
-    if norm and norm in _DOC_LABEL_EN_BY_NORM:
-        return _DOC_LABEL_EN_BY_NORM[norm]
+    if norm:
+        if norm in _DOC_LABEL_EN_BY_NORM:
+            return _strip_pure_year_suffix_en(_DOC_LABEL_EN_BY_NORM[norm])
+
+        # Fuzzy containment match (e.g., title + organization suffix in the same string).
+        best_key = ""
+        best_val = ""
+        for k, v in _DOC_LABEL_EN_BY_NORM.items():
+            if not k:
+                continue
+            if k in norm or norm in k:
+                if len(k) > len(best_key):
+                    best_key = k
+                    best_val = v
+        if best_val:
+            return _strip_pure_year_suffix_en(best_val)
 
     return s
 
@@ -322,11 +340,26 @@ def localize_source_names_in_text(md: str, lang: str) -> str:
     """Replace known guideline filenames inside Markdown text (UI-only)."""
     if lang != "en":
         return md
+
+    def _strip_pure_year_suffix_en(x: str) -> str:
+        return re.sub(r"\s*\(\s*20\d{2}\s*\)\s*$", "", (x or "").strip())
+
     out = md or ""
     for zh_name, en_name in _SOURCE_FILENAME_EN.items():
+        en_noext = os.path.splitext(en_name)[0]
+        en_noext = _strip_pure_year_suffix_en(en_noext)
+
+        # Filename/path variants
         out = out.replace(zh_name, en_name)
-        out = out.replace(os.path.splitext(zh_name)[0], os.path.splitext(en_name)[0])
-        out = out.replace(os.path.splitext(zh_name)[0].split("_")[0], os.path.splitext(en_name)[0])
+        out = out.replace(os.path.splitext(zh_name)[0], en_noext)
+
+        # Title variants (main part before underscores; with/without trailing year parentheses)
+        zh_noext = os.path.splitext(zh_name)[0]
+        zh_main = zh_noext.split("_")[0]
+        zh_main_no_year = re.sub(r"[（(]\s*20\d{2}[^)）]*[)）]\s*$", "", zh_main).strip()
+        out = out.replace(zh_main, en_noext)
+        out = out.replace(zh_main_no_year, en_noext)
+        out = out.replace(re.sub(r"\s+", "", zh_main_no_year), en_noext)
     return out
 
 def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
