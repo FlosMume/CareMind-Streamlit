@@ -264,6 +264,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "draft_reason_openai_error": "ℹ️ 进入草案模式：OpenAI 调用失败（{err}）。请查看 Cloud 日志。",
         "draft_reason_no_hits": "ℹ️ 进入草案模式：未检索到证据片段，未调用 OpenAI。",
         "draft_reason_demo": "ℹ️ 已进入演示模式：检索后端在当前环境不可用。",
+        "dev_tools_hdr": "⚙️ 开发者工具 / Dev tools",
+        "clear_backend_cache": "清理后端缓存",
     },
     "en": {
         "title": "CareMind · Clinical Decision Support (MVP)",
@@ -326,6 +328,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "draft_reason_openai_error": "ℹ️ Draft mode: OpenAI call failed ({err}). Check Cloud logs.",
         "draft_reason_no_hits": "ℹ️ Draft mode: no evidence snippets were retrieved; OpenAI was not called.",
         "draft_reason_demo": "ℹ️ Demo mode: retrieval backend is unavailable in this environment.",
+        "dev_tools_hdr": "⚙️ Dev tools",
+        "clear_backend_cache": "Clear backend cache",
     },
 }
 def t(lang: str, key: str) -> str:
@@ -729,8 +733,8 @@ if res:
             use_container_width=True,
         )
 
-    with st.expander("⚙️ 开发者工具 / Dev tools"):
-        if st.button("🔄 清理后端缓存 (Chroma Client/Collection)"):
+    with st.expander(t(lang, "dev_tools_hdr")):
+        if st.button(f"🔄 {t(lang, 'clear_backend_cache')} (Chroma Client/Collection)"):
             try:
                 st.cache_resource.clear()
                 st.success("已清理，请重新提交查询。")
