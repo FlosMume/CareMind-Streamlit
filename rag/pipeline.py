@@ -5,15 +5,11 @@ rag/pipeline.py
 Orchestrates retrieval + (optional) reasoning between the Streamlit UI (app.py)
 and the backend retriever (rag/retriever.py).
 
-设计目标 / Design goals
-- 轻量导入，避免在 Cloud 因 sqlite/Chroma 问题导致模块导入即失败。
-  Keep imports light so Cloud can boot even if Chroma/SQLite are absent.
-- 提供“演示模式”回退（DEMO），即使后端不可用也能渲染 UI。
-  Provide a DEMO fallback to render UI even when retrieval backend is unavailable.
-- **新增**：支持 `lang`（"zh" 或 "en"），使答案语言与 UI 一致。
-  Accepts `lang` to keep generated text consistent with UI language.
-- **新增**：若存在 OPENAI_API_KEY，则优先调用 OpenAI 生成“正式建议”，
-  失败时自动回退到“草案建议”。
+Design goals
+- Keep imports light so Cloud can boot even if Chroma/SQLite are absent.
+- Provide a DEMO fallback to render UI even when the retrieval backend is unavailable.
+- Accept `lang` ("zh" or "en") so generated text matches the UI language.
+- If OPENAI_API_KEY is present, prefer OpenAI for a “final” answer; fall back to a “draft” answer on failure.
 
 Public API (called from app.py):
     answer(question: str, drug_name: Optional[str], k: int = 4, lang: str = "zh")
@@ -27,32 +23,31 @@ from typing import Any, Dict, List, Optional
 import os
 import traceback
 
-# 读取 Secrets 的小助手（Secrets > env > default）/ Secrets-aware env reader
+# Secrets-aware env reader (Secrets > env > default)
 def _env(key: str, default: str | None = None) -> str | None:
     import os
     try:
         import streamlit as st
-        return os.getenv(key, st.secrets.get(key, default))  # Secrets 覆盖默认
+        return os.getenv(key, st.secrets.get(key, default))  # Secrets override default
     except Exception:
         return os.getenv(key, default)
 
-# 延迟把重活交给 retriever（其中做了 lazy import & sqlite shim）
 # Defer heavy work to retriever (which lazy-imports chroma & patches sqlite)
 from . import retriever as R
 from . import prompt as prompt_en
 from . import prompt_cn as prompt_zh
 
 # -----------------------------------------------------------------------------
-# Config flags（Secrets 可覆盖）/ Config flags (overridable via Secrets)
+# Config flags (overridable via Secrets)
 # -----------------------------------------------------------------------------
-DEMO: bool = (_env("CAREMIND_DEMO", "1") == "1")   # Cloud 缺省演示模式 ON
+DEMO: bool = (_env("CAREMIND_DEMO", "1") == "1")   # Cloud default: demo mode ON
 MAX_K: int = int(_env("CAREMIND_MAX_K", "8"))
 
-# OpenAI 相关配置（模型名可通过 CAREMIND_OPENAI_MODEL 覆盖）
+# OpenAI config (model overridable via CAREMIND_OPENAI_MODEL)
 OPENAI_MODEL_DEFAULT = _env("CAREMIND_OPENAI_MODEL", "gpt-4o-mini")
 
 # -----------------------------------------------------------------------------
-# Data model 返回给 app.py 的结构 / Bundle returned to app.py
+# Bundle returned to app.py
 # -----------------------------------------------------------------------------
 @dataclass
 class AnswerBundle:
@@ -64,7 +59,7 @@ class AnswerBundle:
 # Helpers
 # -----------------------------------------------------------------------------
 def _clamp_k(k: int) -> int:
-    """限制 Top-K 的范围 / Clamp Top-K to a safe range."""
+    """Clamp Top-K to a safe range."""
     try:
         k = int(k)
     except Exception:
@@ -73,13 +68,12 @@ def _clamp_k(k: int) -> int:
 
 def _render_with_citations(raw_text: str) -> str:
     """
-    citation 后处理钩子（留作扩展）/ Citation post-processor hook (no-op for now).
+    Citation post-processor hook (no-op for now).
     """
     return raw_text or ""
 
 def _compose_user_prompt(question: str, drug_name: Optional[str], hits: List[Dict[str, Any]], lang: str) -> str:
     """
-    组装用户提示词，把检索证据拼接到 USER_TEMPLATE 中。
     Compose the end-user prompt by inserting selected evidence into USER_TEMPLATE.
     """
     lines = []
@@ -101,7 +95,7 @@ def _compose_user_prompt(question: str, drug_name: Optional[str], hits: List[Dic
     return templates.USER_TEMPLATE.format(question=question, drug=(drug_name or ""), evidence_md=evidence_md)
 
 def _i18n(lang: str, key: str) -> str:
-    """极简内置文案 i18n，仅覆盖 pipeline 生成的文本 / Minimal inline i18n for pipeline text."""
+    """Minimal inline i18n for pipeline-generated text."""
     ZH = {
         "hdr_demo":  "临床建议（演示）",
         "hdr_draft": "临床建议（草案）",
@@ -132,29 +126,29 @@ def _i18n(lang: str, key: str) -> str:
     }
     return (ZH if lang == "zh" else EN).get(key, key)
 
-# —— OpenAI 相关 —— #
+# --- OpenAI helpers ---
 def _load_dotenv_if_present() -> None:
-    """若项目包含 .env，则尝试加载。"""
+    """If a .env file exists, attempt to load it."""
     try:
         from dotenv import load_dotenv
-        load_dotenv()  # 安静加载，不强依赖
+        load_dotenv()  # best-effort; optional dependency
     except Exception:
         pass
 
 def _openai_available() -> bool:
-    """仅检查环境变量是否存在；真正的 API 错误在调用时捕获。"""
+    """Only checks whether OPENAI_API_KEY is present; API errors are handled at call time."""
     _load_dotenv_if_present()
     return bool(os.getenv("OPENAI_API_KEY"))
 
 def _openai_chat(system_prompt: str, user_prompt: str, model: Optional[str] = None) -> str:
     """
-    统一封装 OpenAI Chat 调用。
-    - 自动读取 OPENAI_API_KEY
-    - 默认模型 gpt-4o-mini（可由 CAREMIND_OPENAI_MODEL 覆盖）
+    Thin wrapper around the OpenAI Chat call.
+    - Reads OPENAI_API_KEY from environment (and related OpenAI env vars)
+    - Default model: gpt-4o-mini (overridable via CAREMIND_OPENAI_MODEL)
     """
     _load_dotenv_if_present()
-    from openai import OpenAI  # 官方 1.x 客户端
-    client = OpenAI()  # 读取 OPENAI_API_KEY / OPENAI_BASE_URL（若配置）
+    from openai import OpenAI  # official 1.x client
+    client = OpenAI()  # reads OPENAI_API_KEY / OPENAI_BASE_URL (if set)
     mdl = model or OPENAI_MODEL_DEFAULT or "gpt-4o-mini"
 
     resp = client.chat.completions.create(
@@ -165,11 +159,11 @@ def _openai_chat(system_prompt: str, user_prompt: str, model: Optional[str] = No
             {"role": "user",   "content": user_prompt},
         ],
     )
-    # 取第一条候选
+    # Take the first candidate
     return (resp.choices[0].message.content or "").strip()
 
 def _first_sentences(txt: str, n_sent: int = 1, limit: int = 180) -> str:
-    """草案模式中用到的简易摘要器。"""
+    """Simple sentence-based summarizer used in draft mode."""
     import re
     sents = re.split(r"(?:。|！|？|\.)", (txt or "").strip())
     pick = "。".join([s for s in sents if s][:n_sent]).strip("。")
@@ -202,7 +196,6 @@ def answer(
     lang: str = "zh"
 ) -> Dict[str, Any]:
     """
-    主入口：负责调用检索 → （优先）OpenAI 生成“正式建议” → 失败时回退“草案建议”，并返回结构化结果。
     Main entry: retrieval → (prefer) OpenAI reasoning → fallback to draft; returns a dict.
     """
     kk = _clamp_k(k)
@@ -215,30 +208,30 @@ def answer(
     openai_reason: str = "missing_key" if not openai_key_present else ""
 
     try:
-        # 1) 指南检索（由 retriever 处理 Chroma & sqlite 兼容）/ Guideline search
+        # 1) Guideline retrieval (retriever handles Chroma & sqlite compatibility)
         hits: List[Dict[str, Any]] = R.search_guidelines(question, k=kk) or []
 
         if openai_key_present and not hits:
             openai_reason = "no_hits"
 
-        # 2) 可选：结构化药品信息（SQLite）/ Optional structured drug info
+        # 2) Optional structured drug info (SQLite)
         drug_struct = None
         if drug_name and drug_name.strip():
             try:
                 drug_struct = R.search_drug_structured(drug_name.strip())
             except Exception:
-                drug_struct = None  # 不因药品库出错而失败 / don't fail the whole pipeline
+                drug_struct = None  # don't fail the whole pipeline due to drug DB errors
 
-        # 3) 优先尝试调用 OpenAI 生成“正式建议”
-        #    - 系统提示词 SYSTEM，与 UI 语言一致
-        #    - 用户提示词：将证据以 markdown 小节拼接，要求模型在结论段落内显式插入 [1][2][3]… 引用
+        # 3) Prefer OpenAI for a "final" answer
+        #    - System prompt matches UI language
+        #    - User prompt includes evidence as Markdown sections; require in-text citations like [1][2][3]
         if openai_key_present and hits:
             try:
                 openai_attempted = True
                 templates = prompt_zh if lang == "zh" else prompt_en
                 user_prompt = _compose_user_prompt(question, drug_name, hits, lang=lang)
 
-                # 追加一个清晰的“格式/引用”指令，确保会出现 [1][2][3] 这种编号
+                # Add a clear formatting/citation instruction to ensure numbered citations like [1][2][3].
                 if lang == "zh":
                     citation_hint = (
                         "\n\n请在结论/建议段落中使用形如 [1][2][3] 的文内引用，"
@@ -258,7 +251,7 @@ def answer(
                 llm_out = _openai_chat(system_prompt=sys_prompt, user_prompt=final_user)
 
                 if llm_out and llm_out.strip():
-                    # OpenAI 路径成功：直接返回模型产物
+                    # OpenAI path succeeded: return the model output directly.
                     out = AnswerBundle(
                         output=_render_with_citations(llm_out),
                         guideline_hits=hits,
@@ -276,13 +269,13 @@ def answer(
                     )
                     return out
             except Exception as e:
-                # 捕获 OpenAI 相关异常，进入草案回退；日志交给 Streamlit 端显示
+                # On OpenAI error, fall back to draft mode; Streamlit UI can surface details.
                 openai_attempted = True
                 openai_error_type = type(e).__name__
                 openai_reason = "openai_error"
                 traceback.print_exc()
 
-        # 4) 回退：用“草案建议”模板生成最小可用文本（保证 UI 不空）
+        # 4) Fallback: generate a minimal draft answer (keeps UI non-empty)
         ev_list = _compact_evidence_list(lang, hits)
         # Natural-language draft (still conservative): keeps UI readable even without OpenAI.
         if lang == "zh":
@@ -342,7 +335,7 @@ def answer(
         return out
 
     except Exception:
-        # DEMO 回退：在 Cloud 无后端依赖时，保持 UI 可用 / DEMO fallback to keep UI usable
+        # DEMO fallback: keep UI usable when backend dependencies are unavailable on Cloud
         if DEMO:
             traceback.print_exc()
             hits = [{
@@ -378,5 +371,5 @@ def answer(
             )
             return out
 
-        # 非演示模式则抛出，让日志显示真实错误 / Re-raise in non-demo mode
+        # Re-raise in non-demo mode so the real error is visible.
         raise
