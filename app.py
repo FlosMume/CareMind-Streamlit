@@ -348,6 +348,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "draft_reason_demo": "ℹ️ 已进入演示模式：检索后端在当前环境不可用。",
         "dev_tools_hdr": "⚙️ 开发者工具 / Dev tools",
         "clear_backend_cache": "清理后端缓存",
+        "clear_backend_cache_ok": "已清理，请重新提交查询。",
+        "clear_backend_cache_fail": "清理失败：{err}",
     },
     "en": {
         "title": "CareMind · Clinical Decision Support (MVP)",
@@ -412,6 +414,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "draft_reason_demo": "ℹ️ Demo mode: retrieval backend is unavailable in this environment.",
         "dev_tools_hdr": "⚙️ Dev tools",
         "clear_backend_cache": "Clear backend cache",
+        "clear_backend_cache_ok": "Cleared. Please submit your query again.",
+        "clear_backend_cache_fail": "Clear failed: {err}",
     },
 }
 def t(lang: str, key: str) -> str:
@@ -856,9 +860,9 @@ if res:
         if st.button(f"🔄 {t(lang, 'clear_backend_cache')} (Chroma Client/Collection)"):
             try:
                 st.cache_resource.clear()
-                st.success("已清理，请重新提交查询。")
+                st.success(t(lang, "clear_backend_cache_ok"))
             except Exception as e:
-                st.error(f"清理失败：{e}")
+                st.error(t(lang, "clear_backend_cache_fail").format(err=e))
 
 # =============================================================================
 # 9) Diagnostics panel (always visible; use retriever's safe interfaces only)
