@@ -252,7 +252,23 @@ def localize_source_name(source: str, lang: str) -> str:
     if not s or lang != "en":
         return s
     base = os.path.basename(s)
-    return _SOURCE_FILENAME_EN.get(base, _SOURCE_FILENAME_EN.get(s, s))
+    if base in _SOURCE_FILENAME_EN:
+        return _SOURCE_FILENAME_EN[base]
+    if s in _SOURCE_FILENAME_EN:
+        return _SOURCE_FILENAME_EN[s]
+
+    # Fallback: substring match (handles full paths / decorated strings)
+    for zh_name, en_name in _SOURCE_FILENAME_EN.items():
+        if zh_name in s:
+            return s.replace(zh_name, en_name)
+
+    # Fallback: no-extension match
+    base_noext = os.path.splitext(base)[0]
+    for zh_name, en_name in _SOURCE_FILENAME_EN.items():
+        zh_noext = os.path.splitext(zh_name)[0]
+        if base_noext == zh_noext:
+            return os.path.splitext(en_name)[0]
+    return s
 
 
 def localize_source_names_in_text(md: str, lang: str) -> str:
@@ -262,6 +278,7 @@ def localize_source_names_in_text(md: str, lang: str) -> str:
     out = md or ""
     for zh_name, en_name in _SOURCE_FILENAME_EN.items():
         out = out.replace(zh_name, en_name)
+        out = out.replace(os.path.splitext(zh_name)[0], os.path.splitext(en_name)[0])
     return out
 
 def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
@@ -690,6 +707,14 @@ tab_adv, tab_evidence, tab_hits, tab_drug, tab_log = st.tabs([
 res: Optional[Dict[str, Any]] = None
 elapsed: Optional[float] = None
 
+# Persist results across reruns (e.g., clicking download triggers a rerun).
+try:
+    if st.session_state.get("cm_last_lang") == lang and st.session_state.get("cm_last_res"):
+        res = st.session_state.get("cm_last_res")
+        elapsed = st.session_state.get("cm_last_elapsed")
+except Exception:
+    pass
+
 
 # =============================================================================
 # 7) Call backend (reflective; compatible with optional lang parameter)
@@ -727,6 +752,14 @@ if submitted:
                         q_clean, drug_name=drug_effective, k=int(k)
                     )
                 elapsed = time.time() - t0
+
+                # Persist the full result so UI doesn't clear on reruns (downloads, toggles, etc.).
+                try:
+                    st.session_state["cm_last_res"] = res
+                    st.session_state["cm_last_elapsed"] = elapsed
+                    st.session_state["cm_last_lang"] = lang
+                except Exception:
+                    pass
 
                 # Store last retrieval stats for diagnostics.
                 try:
