@@ -63,6 +63,7 @@ import sys
 import json
 import glob
 import contextlib
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -113,6 +114,61 @@ if os.getenv("CAREMIND_DEBUG") == "1":
         pass
 
 VERSION = "retriever-2025-12-25"
+
+
+# =============================================================================
+# 1b) Drug name aliases (English → Chinese) for the bundled mini drug DB
+# =============================================================================
+# The bundled `db/drugs.sqlite` / `data/drugs.xlsx` is a small curated set and
+# currently stores drug names primarily in Chinese. In English UI, users may
+# enter the English generic name (e.g., "Metoprolol") which would not match.
+# This alias map is UI-agnostic and only affects structured drug lookup.
+_DRUG_ALIASES_EN_TO_ZH: Dict[str, str] = {
+    # cardio / BP
+    "metoprolol": "美托洛尔",
+    "amlodipine": "氨氯地平",
+    "enalapril": "依那普利",
+    "irbesartan": "厄贝沙坦",
+    "telmisartan": "替米沙坦",
+    "valsartan": "缬沙坦",
+    "benazepril": "贝那普利",
+    "furosemide": "呋塞米",
+    "spironolactone": "螺内酯",
+    # antiplatelet / anticoagulant
+    "aspirin": "阿司匹林",
+    "clopidogrel": "氯吡格雷",
+    "ticagrelor": "替格瑞洛",
+    "warfarin": "华法林",
+    "rivaroxaban": "利伐沙班",
+    # lipid
+    "atorvastatin": "阿托伐他汀",
+    "rosuvastatin": "瑞舒伐他汀",
+    # GI / abx
+    "omeprazole": "奥美拉唑",
+    "levofloxacin": "左氧氟沙星",
+    "amoxicillin clavulanate": "阿莫西林/克拉维酸",
+    "amoxicillin/clavulanate": "阿莫西林/克拉维酸",
+    "cefuroxime": "头孢呋辛",
+    # diabetes
+    "metformin": "二甲双胍",
+    "sitagliptin": "西格列汀",
+    "liraglutide": "利拉鲁肽",
+    "glimepiride": "格列美脲",
+    # respiratory
+    "budesonide": "布地奈德",
+    "formoterol": "福莫特罗",
+    # others
+    "nitroglycerin": "硝酸甘油（舌下片）",
+}
+
+
+def _norm_en_drug(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("β", "beta")
+    s = re.sub(r"[^a-z0-9\s/+-]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 # =============================================================================
@@ -555,32 +611,65 @@ def search_drug_structured(drug_name: str) -> Optional[Dict[str, Any]]:
     A small helper used by pipeline.py. Returns one best row (or None):
         { 'name': str, 'row': dict }
     """
-    key = (drug_name or "").strip()
-    if not key:
+    raw_key = (drug_name or "").strip()
+    if not raw_key:
         return None
+    key = raw_key
     con = _connect_sqlite(DRUG_DB_PATH)
     if con is None:
         return None
     try:
         cur = con.cursor()
-        # Support both Chinese/English input by searching both 'name' and 'generic_name' when present.
-        # Keep it defensive: if a column doesn't exist, fall back to name-only.
+        # Support both v2 schema (drug_name/pregnancy_category) and legacy schema (name/generic_name/pregnancy).
+        cols = set()
         try:
+            cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(drugs);").fetchall()}
+        except Exception:
+            cols = set()
+
+        name_col = "drug_name" if "drug_name" in cols else ("name" if "name" in cols else None)
+        generic_col = "generic_name" if "generic_name" in cols else None
+
+        if not name_col:
+            return None
+
+        if generic_col:
             cur.execute(
-                "SELECT * FROM drugs WHERE (name LIKE ? OR generic_name LIKE ?) ORDER BY name LIMIT 1",
+                f"SELECT * FROM drugs WHERE ({name_col} LIKE ? OR {generic_col} LIKE ?) ORDER BY {name_col} LIMIT 1",
                 (f"%{key}%", f"%{key}%"),
             )
-        except Exception:
-            cur.execute("SELECT * FROM drugs WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{key}%",))
+        else:
+            cur.execute(
+                f"SELECT * FROM drugs WHERE {name_col} LIKE ? ORDER BY {name_col} LIMIT 1",
+                (f"%{key}%",),
+            )
         row = cur.fetchone()
+        if not row:
+            # English UI convenience: map common English generics to the Chinese
+            # names stored in the bundled mini DB.
+            if not re.search(r"[\u4e00-\u9fff]", key):
+                alias = _DRUG_ALIASES_EN_TO_ZH.get(_norm_en_drug(key))
+                if alias and alias != key:
+                    if generic_col:
+                        cur.execute(
+                            f"SELECT * FROM drugs WHERE ({name_col} LIKE ? OR {generic_col} LIKE ?) ORDER BY {name_col} LIMIT 1",
+                            (f"%{alias}%", f"%{alias}%"),
+                        )
+                    else:
+                        cur.execute(
+                            f"SELECT * FROM drugs WHERE {name_col} LIKE ? ORDER BY {name_col} LIMIT 1",
+                            (f"%{alias}%",),
+                        )
+                    row = cur.fetchone()
+
         if not row:
             return None
         name_val = None
         try:
-            if "name" in row.keys():
-                name_val = row["name"]
-            elif "drug_name" in row.keys():
+            if "drug_name" in row.keys():
                 name_val = row["drug_name"]
+            elif "name" in row.keys():
+                name_val = row["name"]
         except Exception:
             name_val = None
         return {"name": str(name_val or key), "row": dict(row)}
