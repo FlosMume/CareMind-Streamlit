@@ -14,6 +14,16 @@ This folder contains technical notes, operations/deployment guides, and project 
 
 - Project doc / planning notes: [docs/notes/caremind_doc.txt](notes/caremind_doc.txt)
 
+## Worklogs
+
+- Worklogs index: [docs/worklogs/](worklogs/)
+- Dec 26, 2025 worklog: [docs/worklogs/README_2025-12-26.md](worklogs/README_2025-12-26.md)
+- Dec 26, 2025 essay: [docs/worklogs/essays/Essay_2025-12-26_Streamlit-UI-and-Cloud-Workability.md](worklogs/essays/Essay_2025-12-26_Streamlit-UI-and-Cloud-Workability.md)
+
+## Tutorials
+
+- Tutorials: [docs/tutorial/](tutorial/)
+
 ## Documentation Metadata Policy
 
 Use Git history as the primary source of authorship. Only add explicit metadata blocks when the document is an operational record or requires accountability.
