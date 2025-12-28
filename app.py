@@ -319,7 +319,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "export_advice": "导出建议（Markdown）",
         "export_evidence": "导出证据（Markdown）",
         "disclaimer": "⚠️ 本工具仅供临床决策参考，不替代医师诊断与处方。",
-        "hits_hdr": "检索片段（Top-{k}，过滤后 {n} 条）",
+        "hits_hdr": "检索片段（Top-{k}即过滤后留 {n} 条）",
         "no_hits": "未检索到符合筛选条件的片段。",
         "drug_hdr": "药品结构化信息（SQLite）",
         "no_drug": "未提供或未检索到对应药品的结构化信息。",
