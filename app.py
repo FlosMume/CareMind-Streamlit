@@ -225,6 +225,46 @@ _SOURCE_FILENAME_EN: Dict[str, str] = {
 }
 
 
+def _norm_doc_label(s: str) -> str:
+    """Normalize doc labels/titles for fuzzy matching (UI-only)."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = os.path.basename(s)
+    s = os.path.splitext(s)[0]
+    s = s.split("_")[0]
+    s = s.replace("《", "").replace("》", "")
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[—–\-·•:：]", "", s)
+    s = re.sub(r"[\(（]\s*20\d\d[^\)）]*[\)）]", "", s)
+    s = re.sub(r"[\(（][^\)）]*年版[\)）]", "", s)
+    return s
+
+
+_DOC_LABEL_EN_BY_NORM: Dict[str, str] = {}
+for _zh_filename, _en_filename in _SOURCE_FILENAME_EN.items():
+    _en_noext = os.path.splitext(_en_filename)[0]
+    _zh_main = os.path.splitext(_zh_filename)[0].split("_")[0]
+    _DOC_LABEL_EN_BY_NORM[_norm_doc_label(_zh_filename)] = _en_noext
+    _DOC_LABEL_EN_BY_NORM[_norm_doc_label(_zh_main)] = _en_noext
+
+
+def localize_doc_label(text: str, lang: str) -> str:
+    """Localize guideline doc titles/labels for UI display only (English mode)."""
+    s = str(text or "").strip()
+    if not s or lang != "en":
+        return s
+
+    mapped = localize_source_name(s, lang)
+    if mapped != s:
+        return os.path.splitext(mapped)[0]
+
+    norm = _norm_doc_label(s)
+    if norm and norm in _DOC_LABEL_EN_BY_NORM:
+        return _DOC_LABEL_EN_BY_NORM[norm]
+    return s
+
+
 def localize_source_name(source: str, lang: str) -> str:
     """Localize guideline source filenames for UI display only."""
     s = str(source or "").strip()
@@ -256,6 +296,7 @@ def localize_source_names_in_text(md: str, lang: str) -> str:
     for zh_name, en_name in _SOURCE_FILENAME_EN.items():
         out = out.replace(zh_name, en_name)
         out = out.replace(os.path.splitext(zh_name)[0], os.path.splitext(en_name)[0])
+        out = out.replace(os.path.splitext(zh_name)[0].split("_")[0], os.path.splitext(en_name)[0])
     return out
 
 
@@ -269,7 +310,8 @@ def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
         m = h.get("meta") or {}
         title = (m.get("title") or m.get("doc_title") or m.get("section_title") or ("无标题" if lang == "zh" else "Untitled"))
         source = (m.get("source") or m.get("source_filename") or ("未知来源" if lang == "zh" else "Unknown"))
-        source = localize_source_name(source, lang)
+        title = localize_doc_label(title, lang)
+        source = localize_doc_label(source, lang)
         year = (m.get("year") or "")
         yr = f"{year}".strip()
         tail = (f"（{yr}）" if lang == "zh" else f"({yr})") if yr else ""
@@ -284,7 +326,8 @@ def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
         m = h.get("meta") or {}
         title = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
         source = (m.get("source") or m.get("source_filename") or "Unknown")
-        source = localize_source_name(source, lang)
+        title = localize_doc_label(title, lang)
+        source = localize_doc_label(source, lang)
         year = (m.get("year") or "")
 
         head = (
@@ -822,7 +865,7 @@ if res:
             for h in hits:
                 m = h.get("meta") or {}
                 s = str(m.get("source") or ("未知来源" if lang == "zh" else "Unknown")).strip()
-                s = localize_source_name(s, lang)
+                s = localize_doc_label(s, lang)
                 counts[s] = counts.get(s, 0) + 1
             st.markdown(" ".join(
                 [f"<span class='cm-chip'>{s} × {n}</span>" for s, n in counts.items()]
@@ -832,7 +875,8 @@ if res:
                 m = h.get("meta") or {}
                 title  = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
                 source = (m.get("source") or m.get("source_filename") or "Unknown")
-                source = localize_source_name(source, lang)
+                title = localize_doc_label(title, lang)
+                source = localize_doc_label(source, lang)
                 year   = (m.get("year") or "")
                 doc_id = str(m.get("id")     or "—")
                 label = f"[{i}] · {title[:60]}"
@@ -867,7 +911,7 @@ if res:
             "k": int(k),
             "elapsed_sec": round(elapsed or 0, 3),
             "sources": [
-                localize_source_name(((h.get("meta") or {}).get("source") or ""), lang)
+                localize_doc_label(((h.get("meta") or {}).get("source") or ""), lang)
                 for h in (res.get("guideline_hits") or [])
             ],
         }
