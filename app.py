@@ -644,6 +644,77 @@ def apply_preferred_drug_name_for_ui(payload: Any, lang: str, preferred_name: st
     return out
 
 
+def _has_cjk(s: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _translate_zh_to_en_cached(text: str, model: str) -> str:
+    """Translate Chinese medical text to English (best-effort; UI-only)."""
+    txt = (text or "").strip()
+    if not txt or not _has_cjk(txt):
+        return txt
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model=model or "gpt-4o-mini",
+            temperature=0.0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional medical translator. "
+                        "Translate the user's Chinese text into English faithfully. "
+                        "Do not add, remove, or infer information. "
+                        "Preserve abbreviations, punctuation, and list separators. "
+                        "Output only the translated text (no Markdown)."
+                    ),
+                },
+                {"role": "user", "content": txt},
+            ],
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or txt
+    except Exception:
+        return txt
+
+
+def translate_structured_drug_for_en_ui(payload: Any, lang: str) -> Any:
+    """Translate structured drug text fields to English when running in English UI.
+
+    This only affects UI rendering; the underlying stored DB values remain unchanged.
+    """
+    if lang != "en":
+        return payload
+    if not bool(os.getenv("OPENAI_API_KEY")):
+        return payload
+    if not isinstance(payload, dict):
+        return payload
+
+    model = os.getenv("CAREMIND_OPENAI_MODEL", "gpt-4o-mini")
+    out = dict(payload)
+    row = out.get("row")
+    if not isinstance(row, dict):
+        return out
+
+    row2 = dict(row)
+    fields = [
+        "indications",
+        "contraindications",
+        "interactions",
+        "pregnancy_category",
+        "pregnancy",
+        "source",
+    ]
+    for k in fields:
+        v = row2.get(k)
+        if isinstance(v, str) and _has_cjk(v):
+            row2[k] = _translate_zh_to_en_cached(v, model)
+    out["row"] = row2
+    return out
+
+
 # =============================================================================
 # 3) Lightweight styles
 # -----------------------------------------------------------------------------
@@ -1003,6 +1074,7 @@ if res:
         if res.get("drug"):
               preferred = (drug_effective or drug or "").strip() if "drug_effective" in globals() else (drug or "").strip()
               payload = apply_preferred_drug_name_for_ui(res["drug"], lang, preferred)
+              payload = translate_structured_drug_for_en_ui(payload, lang)
               st.json(localize_drug_record_for_ui(payload, lang), expanded=False)
         else:
             st.caption(t(lang, "no_drug"))
