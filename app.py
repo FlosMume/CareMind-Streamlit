@@ -289,7 +289,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "title": "CareMind · 临床决策支持（MVP）",
         "question_label": "输入临床问题",
         "question_ph": "例如：慢性肾病（CKD）患者使用 ACEI/ARB 时如何监测？多久复查？",
-        "drug_label": "（可选）指定药品名（如：阿司匹林）",
+        "drug_label": "指定药品名（可选）",
+        "drug_ph": "如：阿司匹林",
         "submit": "生成建议",
         "tab_advice": "🧭 建议",
         "tab_evidence_list": "📑 证据清单",
@@ -335,6 +336,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "warn_need_q": "请输入临床问题后再生成建议。",
         "err_backend": "后端错误（详见下方日志/诊断）。",
         "diag_title": "🔎 环境诊断",
+        "diag_note": "仅供开发/调试使用；普通用户可忽略。",
         "diag_cfg": "有效配置（优先 Secrets）",
         "diag_chroma": "Chroma 集合：",
         "diag_chroma_err": "Chroma 访问错误：",
@@ -349,7 +351,8 @@ I18N: Dict[str, Dict[str, str]] = {
         "title": "CareMind · Clinical Decision Support (MVP)",
         "question_label": "Enter your clinical question",
         "question_ph": "e.g., For CKD patients on ACEI/ARB, how to monitor and how often?",
-        "drug_label": "(Optional) Drug name (e.g., Aspirin)",
+        "drug_label": "(Optional) Drug name",
+        "drug_ph": "e.g., Aspirin",
         "submit": "Generate Advice",
         "tab_advice": "🧭 Advice",
         "tab_evidence_list": "📑 Evidence List",
@@ -395,6 +398,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "warn_need_q": "Please enter a clinical question first.",
         "err_backend": "Backend error (see logs/diagnostics below).",
         "diag_title": "🔎 Environment Diagnostic",
+        "diag_note": "For developers/debugging only; most users can ignore.",
         "diag_cfg": "Effective config (Secrets-first):",
         "diag_chroma": "Chroma collections:",
         "diag_chroma_err": "Chroma access error: ",
@@ -446,7 +450,9 @@ _DRUG_FIELD_LABELS_ZH: Dict[str, str] = {
     "pregnancy_category": "妊娠分级/用药建议",
     "lactation": "哺乳期",
     "indication": "适应症",
+    "indications": "适应症",
     "contraindication": "禁忌症",
+    "contraindications": "禁忌症",
     "warning": "警告/注意事项",
     "dosage": "剂量",
     "route": "给药途径",
@@ -458,7 +464,9 @@ _DRUG_FIELD_LABELS_ZH: Dict[str, str] = {
     "source": "来源",
     "updated_at": "更新时间",
     "created_at": "创建时间",
-    "id": "ID",
+    "id": "识别码",
+    "ID": "识别码",
+    "row": "行",
 }
 
 
@@ -510,6 +518,7 @@ with st.sidebar:
     # Note: don't instantiate another chromadb.PersistentClient here;
     # always use retriever's singleton client to avoid "different settings" errors.
     with st.expander(t(lang, "diag_title"), expanded=False):
+        st.caption(t(lang, "diag_note"))
         st.write("**Python version**:", sys.version)
         st.write("**sqlite3 module version**:", sqlite3.version)          # Python wrapper version
         st.write("**sqlite3 library version**:", sqlite3.sqlite_version)  # Underlying lib version
@@ -601,7 +610,11 @@ with st.form("cm_query"):
     q = st.text_input(t(lang, "question_label"),
                       placeholder=t(lang, "question_ph"),
                       value=q_init)
-    drug = st.text_input(t(lang, "drug_label"), value=(prefill or {}).get("drug", ""))
+    drug = st.text_input(
+        t(lang, "drug_label"),
+        placeholder=t(lang, "drug_ph"),
+        value=(prefill or {}).get("drug", ""),
+    )
     submitted = st.form_submit_button(t(lang, "submit"), use_container_width=True)
 
 
@@ -849,6 +862,7 @@ if res:
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
     with st.expander(title, expanded=False):
+        st.caption(t(lang, "diag_note"))
         # Effective config (Secrets-first)
         keys = ["CAREMIND_DEMO", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION",
                 "EMBEDDING_MODEL", "DRUG_DB_PATH"]
