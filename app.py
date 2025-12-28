@@ -179,6 +179,81 @@ def normalize_evidence_list_md(md: str, lang: str) -> str:
     # Render as Markdown bullets so Streamlit guarantees one item per line.
     return "\n".join([f"- {it}" for it in items]).strip() + "\n"
 
+
+_SOURCE_FILENAME_EN: Dict[str, str] = {
+    "2型糖尿病患者运动方案的最佳证据总结(2019).pdf": "Best Evidence Summary: Exercise Programs for Type 2 Diabetes (2019).pdf",
+    "《中国高血压防治指南(2024年修订版)》新增内容解读 ——以改善血压变异和降压目标范围内时间为核心的高质量降压策略浅析_张新军.pdf": "Interpretation: Updates in Chinese Hypertension Guidelines (2024 revision) (Zhang Xinjun).pdf",
+    "《妊娠期糖尿病临床护理实践指南》推荐意见专家共识_周英凤(2020).pdf": "Expert Consensus: Recommendations for the Nursing Practice Guideline on Gestational Diabetes (Zhou Yingfeng, 2020).pdf",
+    "中国2型糖尿病防治指南（2020年版）.pdf": "Chinese Guideline for Prevention and Treatment of Type 2 Diabetes (2020).pdf",
+    "中国慢性肾脏病早期评价与管理指南(2023).pdf": "Chinese Guideline for Early Evaluation and Management of Chronic Kidney Disease (2023).pdf",
+    "中国高血压患者心率管理多学科专家共识（2021年版）_高血压心率管理多学科共识组.pdf": "Multidisciplinary Expert Consensus: Heart Rate Management in Hypertensive Patients (2021).pdf",
+    "中国高血压防治指南(2024年修订版).pdf": "Chinese Guideline for Prevention and Treatment of Hypertension (2024 revision).pdf",
+    "冠心病合并2 型糖尿病患者的血糖管理专家共识(2024)_中国医疗保健国际交流促进会心血管病学分会.pdf": "Expert Consensus: Glycemic Management in CHD with Type 2 Diabetes (2024).pdf",
+    "国家基层糖尿病防治管理指南（2022）.pdf": "National Primary Care Guideline: Diabetes Prevention, Treatment, and Management (2022).pdf",
+    "国家基层高血压防治管理指南 2020版.pdf": "National Primary Care Guideline: Hypertension Prevention, Treatment, and Management (2020).pdf",
+    "妊娠期糖尿病患者产前血糖管理的证据总结_秦煜(2023).pdf": "Evidence Summary: Antenatal Glycemic Management in Gestational Diabetes (Qin Yu, 2023).pdf",
+    "成人2型糖尿病的高血压管理中国专家共识(2025).pdf": "Chinese Expert Consensus: Hypertension Management in Adults with Type 2 Diabetes (2025).pdf",
+    "成人糖尿病患者血压管理专家共识(2021).pdf": "Expert Consensus: Blood Pressure Management in Adults with Diabetes (2021).pdf",
+    "糖尿病患者体重管理专家共识(2024版).pdf": "Expert Consensus: Weight Management in Patients with Diabetes (2024).pdf",
+    "糖尿病患者甲病管理的最佳证据总结_陈欢(2022).pdf": "Best Evidence Summary: Thyroid Disorders Management in Patients with Diabetes (Chen Huan, 2022).pdf",
+    "糖尿病患者血脂管理中国专家共识（2024版）.pdf": "Chinese Expert Consensus: Lipid Management in Patients with Diabetes (2024).pdf",
+}
+
+
+def localize_source_name(source: str, lang: str) -> str:
+    """Localize guideline source filenames for UI display only."""
+    s = str(source or "").strip()
+    if not s or lang != "en":
+        return s
+    base = os.path.basename(s)
+    return _SOURCE_FILENAME_EN.get(base, _SOURCE_FILENAME_EN.get(s, s))
+
+
+def localize_source_names_in_text(md: str, lang: str) -> str:
+    """Replace known guideline filenames inside Markdown text (UI-only)."""
+    if lang != "en":
+        return md
+    out = md or ""
+    for zh_name, en_name in _SOURCE_FILENAME_EN.items():
+        out = out.replace(zh_name, en_name)
+    return out
+
+
+def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
+    """Render a compact Evidence List (title/source/year only) from retrieved hits."""
+    if not hits:
+        return "（暂无证据片段）" if lang == "zh" else "(No evidence snippets available.)"
+
+    lines: List[str] = []
+    for i, h in enumerate(hits or [], 1):
+        m = h.get("meta") or {}
+        title = (m.get("title") or m.get("doc_title") or m.get("section_title") or ("无标题" if lang == "zh" else "Untitled"))
+        source = (m.get("source") or m.get("source_filename") or ("未知来源" if lang == "zh" else "Unknown"))
+        source = localize_source_name(source, lang)
+        year = (m.get("year") or "")
+        yr = f"{year}".strip()
+        tail = (f"（{yr}）" if lang == "zh" else f"({yr})") if yr else ""
+        lines.append(f"- [{i}] {title} — {source} {tail}".rstrip())
+    return "\n".join(lines).strip() + "\n"
+
+
+def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
+    """Render evidence snippets as Markdown (for download)."""
+    lines: List[str] = []
+    for i, h in enumerate(hits or [], 1):
+        m = h.get("meta") or {}
+        title = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
+        source = (m.get("source") or m.get("source_filename") or "Unknown")
+        source = localize_source_name(source, lang)
+        year = (m.get("year") or "")
+
+        head = (
+            f"### {i} {title}\n\n"
+            + (f"- 来源：{source} · 年份：{year}\n\n" if lang == "zh" else f"- Source: {source} · Year: {year}\n\n")
+        )
+        lines.append(head + (h.get("content") or "") + "\n")
+    return "\n".join(lines)
+
 def friendly_hints(lang: str, exc: Exception) -> List[str]:
     """Map common backend exceptions to user-friendly troubleshooting hints."""
     msg = str(exc).lower()
@@ -264,7 +339,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "draft_reason_openai_error": "ℹ️ 进入草案模式：OpenAI 调用失败（{err}）。请查看 Cloud 日志。",
         "draft_reason_no_hits": "ℹ️ 进入草案模式：未检索到证据片段，未调用 OpenAI。",
         "draft_reason_demo": "ℹ️ 已进入演示模式：检索后端在当前环境不可用。",
-        "dev_tools_hdr": "⚙️ 开发者工具 / Dev tools",
+        "dev_tools_hdr": "⚙️ 开发者工具",
         "clear_backend_cache": "清理后端缓存",
         "clear_backend_cache_ok": "已清理，请重新提交查询。",
         "clear_backend_cache_fail": "清理失败：{err}",
@@ -658,6 +733,7 @@ if res:
     with tab_evidence:
         hits_for_list: List[Dict[str, Any]] = res.get("guideline_hits") or []
         ev_list = evidence_list_md.strip() if evidence_list_md.strip() else evidence_list_md_from_hits(lang, hits_for_list)
+        ev_list = localize_source_names_in_text(ev_list, lang)
         ev_list = link_citations(ev_list)
         ev_list = normalize_evidence_list_md(ev_list, lang)
         st.markdown(ev_list, unsafe_allow_html=False)
@@ -684,6 +760,7 @@ if res:
             for h in hits:
                 m = h.get("meta") or {}
                 s = str(m.get("source") or ("未知来源" if lang == "zh" else "Unknown")).strip()
+                s = localize_source_name(s, lang)
                 counts[s] = counts.get(s, 0) + 1
             st.markdown(" ".join(
                 [f"<span class='cm-chip'>{s} × {n}</span>" for s, n in counts.items()]
@@ -693,6 +770,7 @@ if res:
                 m = h.get("meta") or {}
                 title  = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
                 source = (m.get("source") or m.get("source_filename") or "Unknown")
+                source = localize_source_name(source, lang)
                 year   = (m.get("year") or "")
                 doc_id = str(m.get("id")     or "—")
                 label = f"[{i}] · {title[:60]}"
@@ -726,7 +804,10 @@ if res:
             "drug": drug.strip() or None,
             "k": int(k),
             "elapsed_sec": round(elapsed or 0, 3),
-            "sources": [ (h.get("meta") or {}).get("source") for h in (res.get("guideline_hits") or []) ],
+            "sources": [
+                localize_source_name(((h.get("meta") or {}).get("source") or ""), lang)
+                for h in (res.get("guideline_hits") or [])
+            ],
         }
         st.json(localize_run_log_for_ui(log, lang))
         st.download_button(
