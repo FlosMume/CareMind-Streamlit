@@ -676,6 +676,34 @@ def localize_drug_record_for_ui(obj: Any, lang: str) -> Any:
     return obj
 
 
+def apply_preferred_drug_name_for_ui(payload: Any, lang: str, preferred_name: str | None) -> Any:
+    """In English UI, prefer showing the user-entered drug name (UI-only)."""
+    if lang != "en":
+        return payload
+    pref = (preferred_name or "").strip()
+    if not pref:
+        return payload
+    # Only apply for Latin-ish inputs (avoid overwriting Chinese queries).
+    if not re.search(r"[A-Za-z]", pref) or re.search(r"[\u4e00-\u9fff]", pref):
+        return payload
+    if not isinstance(payload, dict):
+        return payload
+
+    out = dict(payload)
+    out["name"] = pref
+    row = out.get("row")
+    if isinstance(row, dict):
+        row2 = dict(row)
+        if "drug_name" in row2:
+            row2["drug_name"] = pref
+        if "name" in row2:
+            row2["name"] = pref
+        if "generic_name" in row2 and (not str(row2.get("generic_name") or "").strip()):
+            row2["generic_name"] = pref
+        out["row"] = row2
+    return out
+
+
 # =============================================================================
 # 3) Lightweight styles
 # -----------------------------------------------------------------------------
@@ -1040,7 +1068,9 @@ if res:
     with tab_drug:
         st.subheader(t(lang, "drug_hdr"))
         if res.get("drug"):
-            st.json(localize_drug_record_for_ui(res["drug"], lang), expanded=False)
+            preferred = (drug_effective or drug or "").strip() if "drug_effective" in globals() else (drug or "").strip()
+            payload = apply_preferred_drug_name_for_ui(res["drug"], lang, preferred)
+            st.json(localize_drug_record_for_ui(payload, lang), expanded=False)
         else:
             st.caption(t(lang, "no_drug"))
 
