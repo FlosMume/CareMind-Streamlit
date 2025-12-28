@@ -43,47 +43,6 @@ load_dotenv()
 
 
 # =============================================================================
-# 0) Sidebar: environment diagnostics (versions/paths/collection counts)
-#    Note: don't instantiate another chromadb.PersistentClient here;
-#    always use retriever's singleton client to avoid "different settings" errors.
-# -----------------------------------------------------------------------------
-with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
-    st.write("**Python version**:", sys.version)
-    st.write("**sqlite3 module version**:", sqlite3.version)          # Python wrapper version
-    st.write("**sqlite3 library version**:", sqlite3.sqlite_version)  # Underlying lib version
-
-    # Version info doesn't require a client; pure imports are safe.
-    try:
-        import torch
-        st.write("**Torch version**:", torch.__version__)
-    except Exception as e:
-        st.error(f"Torch not available: {e}")
-
-    try:
-        chromadb = importlib.import_module("chromadb")
-        st.write("**Chroma version**:", chromadb.__version__)
-    except Exception as e:
-        st.error(f"Chroma import failed: {e}")
-
-    persist = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
-    coll = os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2")
-    st.write("**CHROMA_PERSIST_DIR**:", persist)
-    st.write("**CHROMA_COLLECTION (from env)**:", coll)
-
-    # ✅ Use retriever's singleton client for counts to avoid creating a second client.
-    try:
-        count = R.primary_collection_count()
-        st.write("**Collection count (active)**:", count)
-        # To list collections, use list_collections_safe (won't raise).
-        cols = R.list_collections_safe()
-        if cols:
-            st.write("**Collections (name → count)**:",
-                     {c.get("name", ""): c.get("count", -1) for c in cols})
-    except Exception as e:
-        st.error(f"❌ Failed to query collections via retriever: {e}")
-
-
-# =============================================================================
 # 1) Helper: Secrets-first env reader + friendly utilities
 # -----------------------------------------------------------------------------
 def _env(key: str, default: str | None = None) -> str | None:
@@ -148,15 +107,12 @@ def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
 
 
 def strip_redundant_advice_heading(md: str, lang: str) -> str:
-    """Remove a leading "Advice:" heading line when the UI already provides the section header.
-
-    The parser supports both English and Chinese headings.
-    """
+    """Remove a leading '建议：'/'Advice:' line when the UI already provides the section header."""
     if not md:
         return md
     heading_only = r"(?mi)^\s*(?:\*\*|__)?\s*(建议|advice)\s*(?:\*\*|__)?\s*[:：]\s*$"
     lines = md.splitlines()
-    # Case A: first line is just a heading like "Advice:".
+    # Case A: first line is just a heading like "建议：" / "Advice:"
     if lines and re.match(heading_only, lines[0] or ""):
         lines = lines[1:]
         if lines and not lines[0].strip():
@@ -175,7 +131,7 @@ def strip_evidence_list_heading_in_advice(md: str) -> str:
     """Remove stray Evidence List headings that occasionally leak into the advice body."""
     if not md:
         return md
-    # Remove standalone header lines like "Evidence List:" (including bold wrappers).
+    # Remove standalone header lines like "证据清单：" / "Evidence List:" (including bold wrappers)
     md = re.sub(
         r"(?mi)^\s*(?:\*\*|__)?\s*(evidence\s+list|证据清单)\s*(?:\*\*|__)?\s*[:：]?\s*$\n?",
         "",
@@ -342,7 +298,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "tab_drug": "💊 药品结构化",
         "tab_log": "🪵 运行日志",
         "settings": "⚙️ 设置",
-        "k_slider": "检索片段数（Top-K）",
+        "k_slider": "Top-K（检索片段数）",
         "show_meta": "显示片段元数据",
         "expand_hits": "展开所有片段",
         "filters": "🧩 证据筛选（前端）",
@@ -370,7 +326,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "history_hdr": "🗂️ 本会话历史（点击复用）",
         "no_history": "暂无历史记录。",
         "reuse": "复用",
-        "reused_tip": "已复用：{q}（药品：{drug}，K={k}）。可编辑后再次生成。",
+        "reused_tip": "已复用：{q}（药品：{drug}，Top-K（检索片段数）={k}）。可编辑后再次生成。",
         "page_footer": "© CareMind · MVP CDSS | 本工具仅供临床决策参考，不替代医师诊断与处方。",
         "chips_src": "来源：",
         "chips_year": "年份：",
@@ -402,7 +358,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "tab_drug": "💊 Drug (Structured)",
         "tab_log": "🪵 Run Logs",
         "settings": "⚙️ Settings",
-        "k_slider": "Top-K retrieved segments",
+        "k_slider": "Top-K (retrieval snippets)",
         "show_meta": "Show snippet metadata",
         "expand_hits": "Expand all snippets",
         "filters": "🧩 Evidence Filters (client-side)",
@@ -430,7 +386,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "history_hdr": "🗂️ Session History (click to reuse)",
         "no_history": "No history yet.",
         "reuse": "Reuse",
-        "reused_tip": "Reused: {q} (Drug: {drug}, K={k}). Edit then generate again.",
+        "reused_tip": "Reused: {q} (Drug: {drug}, Top-K={k}). Edit then generate again.",
         "page_footer": "© CareMind · MVP CDSS | For clinical reference only.",
         "chips_src": "Source:",
         "chips_year": "Year:",
@@ -438,7 +394,7 @@ I18N: Dict[str, Dict[str, str]] = {
         "stats_hits": "Snippets: {n} · Total chars: {c}",
         "warn_need_q": "Please enter a clinical question first.",
         "err_backend": "Backend error (see logs/diagnostics below).",
-        "diag_title": "🔎 Environment Diagnostics",
+        "diag_title": "🔎 Environment Diagnostic",
         "diag_cfg": "Effective config (Secrets-first):",
         "diag_chroma": "Chroma collections:",
         "diag_chroma_err": "Chroma access error: ",
@@ -452,6 +408,29 @@ I18N: Dict[str, Dict[str, str]] = {
 }
 def t(lang: str, key: str) -> str:
     return I18N.get(lang, I18N["zh"]).get(key, key)
+
+
+def localize_run_log_for_ui(log: Dict[str, Any], lang: str) -> Dict[str, Any]:
+    """Localize run-log keys/values for UI display only."""
+    if lang == "zh":
+        return {
+            "运行日期": log.get("time"),
+            "语言": "中文" if log.get("lang") == "zh" else "英文",
+            "问题": log.get("question"),
+            "药品": log.get("drug"),
+            "Top-K（检索片段数）": log.get("k"),
+            "耗时（秒）": log.get("elapsed_sec"),
+            "来源": log.get("sources"),
+        }
+    return {
+        "Run time": log.get("time"),
+        "Language": "English" if log.get("lang") == "en" else "Chinese",
+        "Question": log.get("question"),
+        "Drug": log.get("drug"),
+        "Top-K (retrieval snippets)": log.get("k"),
+        "Elapsed (sec)": log.get("elapsed_sec"),
+        "Sources": log.get("sources"),
+    }
 
 
 # =============================================================================
@@ -519,8 +498,53 @@ footer{visibility:hidden;}
 # 4) Sidebar (settings/filters/presets/history)
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    lang = st.selectbox("Language / 语言", options=["zh", "en"], index=0,
-                        format_func=lambda x: "中文" if x == "zh" else "English")
+    lang = st.selectbox(
+        "Language / 语言",
+        options=["zh", "en"],
+        index=0,
+        format_func=lambda x: "中文" if x == "zh" else "English",
+        key="cm_lang",
+    )
+
+    # Sidebar: environment diagnostics (versions/paths/collection counts)
+    # Note: don't instantiate another chromadb.PersistentClient here;
+    # always use retriever's singleton client to avoid "different settings" errors.
+    with st.expander(t(lang, "diag_title"), expanded=False):
+        st.write("**Python version**:", sys.version)
+        st.write("**sqlite3 module version**:", sqlite3.version)          # Python wrapper version
+        st.write("**sqlite3 library version**:", sqlite3.sqlite_version)  # Underlying lib version
+
+        # Version info doesn't require a client; pure imports are safe.
+        try:
+            import torch
+            st.write("**Torch version**:", torch.__version__)
+        except Exception as e:
+            st.error(f"Torch not available: {e}")
+
+        try:
+            chromadb = importlib.import_module("chromadb")
+            st.write("**Chroma version**:", chromadb.__version__)
+        except Exception as e:
+            st.error(f"Chroma import failed: {e}")
+
+        persist = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
+        coll = os.getenv("CHROMA_COLLECTION", "guideline_chunks_v2")
+        st.write("**CHROMA_PERSIST_DIR**:", persist)
+        st.write("**CHROMA_COLLECTION (from env)**:", coll)
+
+        # ✅ Use retriever's singleton client for counts to avoid creating a second client.
+        try:
+            count = R.primary_collection_count()
+            st.write("**Collection count (active)**:", count)
+            # To list collections, use list_collections_safe (won't raise).
+            cols = R.list_collections_safe()
+            if cols:
+                st.write(
+                    "**Collections (name → count)**:",
+                    {c.get("name", ""): c.get("count", -1) for c in cols},
+                )
+        except Exception as e:
+            st.error(f"❌ Failed to query collections via retriever: {e}")
     st.header(t(lang, "settings"))
 
     k = st.slider(t(lang, "k_slider"), min_value=2, max_value=8, value=4, step=1)
@@ -762,14 +786,14 @@ if res:
 
             for i, h in enumerate(hits, 1):
                 m = h.get("meta") or {}
-                # title  = str(m.get("title")  or ("Untitled (zh)" if lang == "zh" else "Untitled"))
-                # source = str(m.get("source") or ("Unknown (zh)"  if lang == "zh" else "Unknown"))
+                # title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
+                # source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
                 # year   = str(m.get("year")   or "—")
                 title  = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
                 source = (m.get("source") or m.get("source_filename") or "Unknown")
                 year   = (m.get("year") or "")
                 doc_id = str(m.get("id")     or "—")
-                label = f"{i} · {title[:60]}"
+                label = f"[{i}] · {title[:60]}"
                 st.markdown(f"<a id='hit-{i}'></a>", unsafe_allow_html=True)
                 with st.expander(label, expanded=False):
                     if show_meta:
@@ -802,7 +826,7 @@ if res:
             "elapsed_sec": round(elapsed or 0, 3),
             "sources": [ (h.get("meta") or {}).get("source") for h in (res.get("guideline_hits") or []) ],
         }
-        st.json(log)
+        st.json(localize_run_log_for_ui(log, lang))
         st.download_button(
             t(lang, "log_export"),
             data=json.dumps([log], ensure_ascii=False, indent=2).encode("utf-8"),
