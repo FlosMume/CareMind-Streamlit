@@ -105,8 +105,8 @@ def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
     """Split model output into (advice_md, evidence_list_md).
 
     The OpenAI prompt templates ask for two sections:
-    - "Clinical Recommendation Points" / "临床建议要点"
-    - "Evidence List" / "证据清单"
+    - "Clinical Recommendation Points"
+    - "Evidence List"
     plus a final compliance line.
 
     We render the Evidence List only in the Evidence tab (not inside Advice).
