@@ -180,6 +180,31 @@ def normalize_evidence_list_md(md: str, lang: str) -> str:
     return "\n".join([f"- {it}" for it in items]).strip() + "\n"
 
 
+def extract_drug_from_question(q: str) -> tuple[str, Optional[str]]:
+    """Extract a trailing drug-name line from a pasted template (best-effort).
+
+    Conservative heuristic: only extracts the last non-empty line if it looks like
+    a labeled drug line (e.g., "Medicine (optional): ...") and returns (question, drug).
+    """
+    txt = (q or "").rstrip()
+    lines = [ln.rstrip() for ln in txt.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return (q or ""), None
+
+    last = lines[-1].strip()
+
+    m = re.match(r"(?i)^\s*(medicine\s*\(optional\)|drug\s*name|drug)\s*[:：]\s*(.+)$", last)
+    if not m:
+        return (q or ""), None
+    drug = (m.group(2) or "").strip()
+    if not drug:
+        return (q or ""), None
+
+    return "\n".join(lines[:-1]).strip(), drug
+
+
 _SOURCE_FILENAME_EN: Dict[str, str] = {
     "2型糖尿病患者运动方案的最佳证据总结(2019).pdf": "Best Evidence Summary: Exercise Programs for Type 2 Diabetes (2019).pdf",
     "《中国高血压防治指南(2024年修订版)》新增内容解读 ——以改善血压变异和降压目标范围内时间为核心的高质量降压策略浅析_张新军.pdf": "Interpretation: Updates in Chinese Hypertension Guidelines (2024 revision) (Zhang Xinjun).pdf",
@@ -206,7 +231,21 @@ def localize_source_name(source: str, lang: str) -> str:
     if not s or lang != "en":
         return s
     base = os.path.basename(s)
-    return _SOURCE_FILENAME_EN.get(base, _SOURCE_FILENAME_EN.get(s, s))
+    if base in _SOURCE_FILENAME_EN:
+        return _SOURCE_FILENAME_EN[base]
+    if s in _SOURCE_FILENAME_EN:
+        return _SOURCE_FILENAME_EN[s]
+
+    for zh_name, en_name in _SOURCE_FILENAME_EN.items():
+        if zh_name in s:
+            return s.replace(zh_name, en_name)
+
+    base_noext = os.path.splitext(base)[0]
+    for zh_name, en_name in _SOURCE_FILENAME_EN.items():
+        zh_noext = os.path.splitext(zh_name)[0]
+        if base_noext == zh_noext:
+            return os.path.splitext(en_name)[0]
+    return s
 
 
 def localize_source_names_in_text(md: str, lang: str) -> str:
@@ -216,6 +255,7 @@ def localize_source_names_in_text(md: str, lang: str) -> str:
     out = md or ""
     for zh_name, en_name in _SOURCE_FILENAME_EN.items():
         out = out.replace(zh_name, en_name)
+        out = out.replace(os.path.splitext(zh_name)[0], os.path.splitext(en_name)[0])
     return out
 
 
@@ -618,6 +658,14 @@ tab_adv, tab_evidence, tab_hits, tab_drug, tab_log = st.tabs([
 res: Optional[Dict[str, Any]] = None
 elapsed: Optional[float] = None
 
+# Persist results across reruns (e.g., clicking download triggers a rerun).
+try:
+    if st.session_state.get("cm_last_lang") == lang and st.session_state.get("cm_last_res"):
+        res = st.session_state.get("cm_last_res")
+        elapsed = st.session_state.get("cm_last_elapsed")
+except Exception:
+    pass
+
 
 # =============================================================================
 # 7) Call backend (reflective; compatible with or without a lang parameter)
@@ -637,16 +685,30 @@ if submitted:
                         if not re.match(r"(?i)^\s*(药品名称|药品|drug\s*name|drug)\s*[:：]", ln.strip())
                     ]
                 ).strip()
+                # If the dedicated drug input is empty, try extracting a trailing template line.
+                extracted_drug: Optional[str] = None
+                if not (drug or "").strip():
+                    q_clean, extracted_drug = extract_drug_from_question(q_clean)
+
+                drug_effective = (drug or "").strip() or (extracted_drug or "").strip() or None
                 sig_params = inspect.signature(cm_pipeline.answer).parameters
                 if "lang" in sig_params:
                     res = cm_pipeline.answer(
-                        q_clean, drug_name=(drug.strip() or None), k=int(k), lang=lang
+                        q_clean, drug_name=drug_effective, k=int(k), lang=lang
                     )
                 else:
                     res = cm_pipeline.answer(
-                        q_clean, drug_name=(drug.strip() or None), k=int(k)
+                        q_clean, drug_name=drug_effective, k=int(k)
                     )
                 elapsed = time.time() - t0
+
+                # Persist the full result so UI doesn't clear on reruns (downloads, toggles, etc.).
+                try:
+                    st.session_state["cm_last_res"] = res
+                    st.session_state["cm_last_elapsed"] = elapsed
+                    st.session_state["cm_last_lang"] = lang
+                except Exception:
+                    pass
 
                 # Store last retrieval stats for diagnostics.
                 try:
@@ -657,7 +719,7 @@ if submitted:
 
                 # Record into session history
                 st.session_state.setdefault("cm_history", []).append(
-                    {"q": q.strip(), "drug": (drug.strip() or None), "k": int(k), "time": time.time()}
+                    {"q": q.strip(), "drug": drug_effective, "k": int(k), "time": time.time()}
                 )
             except Exception as e:
                 st.error(t(lang, "err_backend"))
