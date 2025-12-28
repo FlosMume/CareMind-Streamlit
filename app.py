@@ -2,15 +2,15 @@
 """
 CareMind · MVP CDSS (Streamlit, bilingual zh/en)
 ------------------------------------------------
-特性 / Features
-- 双语 UI（中文 / English）
-- 通过 rag.pipeline.answer 提供建议文本（反射式调用，兼容是否含 lang 参数）
-- 证据片段/药品结构化/运行日志 Tab
-- ✅ 诊断面板：展示有效配置（Secrets 优先）、chroma_store 是否存在、
-  Chroma 集合与条目数（调用 retriever.list_collections_safe / primary_collection_count，
-  避免额外创建第二个 Chroma 客户端）
-- ✅ 本会话历史记录与“一键复用”
-- 保留 Python/sqlite/Torch/Chroma 版本信息显示（不构造额外 Chroma 客户端）
+Features
+- Bilingual UI (Chinese/English)
+- Provides advice text via rag.pipeline.answer (reflective call; compatible with an optional lang parameter)
+- Tabs for evidence snippets / structured drug info / runtime logs
+- ✅ Diagnostics panel: shows effective config (Secrets-first), whether chroma_store exists, and
+    Chroma collection names & counts (via retriever.list_collections_safe / primary_collection_count;
+    avoids creating a second Chroma client)
+- ✅ Session history with one-click reuse
+- Shows Python/sqlite/Torch/Chroma version info (without constructing an extra Chroma client)
 """
 
 from __future__ import annotations
@@ -34,25 +34,25 @@ from typing import Any, Dict, List, Optional
 import importlib
 
 import streamlit as st
-# 先导入 retriever：其内部会根据需要安装 SQLite shim（老版本 SQLite 的云端有用）
-from rag import retriever as R  # noqa: F401   # 用于 shim 与缓存化的 Chroma 客户端
-import rag.pipeline as cm_pipeline          # 用模块导入，避免热重载下的符号遮蔽
+# Import retriever first: it can install a SQLite shim when needed (useful on cloud hosts with older SQLite).
+from rag import retriever as R  # noqa: F401   # Used for shim setup and cached/singleton Chroma client
+import rag.pipeline as cm_pipeline          # Import the module to avoid symbol shadowing under hot-reload
 import sqlite3
 from dotenv import load_dotenv
 load_dotenv()
 
 
 # =============================================================================
-# 0) 侧边栏：环境诊断（版本/路径/集合计数）
-#    小心：不要在这里直接实例化另一个 chromadb.PersistentClient，
-#    统一走 retriever 的单例客户端，以避免“different settings”报错。
+# 0) Sidebar: environment diagnostics (versions/paths/collection counts)
+#    Note: don't instantiate another chromadb.PersistentClient here;
+#    always use retriever's singleton client to avoid "different settings" errors.
 # -----------------------------------------------------------------------------
 with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
     st.write("**Python version**:", sys.version)
     st.write("**sqlite3 module version**:", sqlite3.version)          # Python wrapper version
     st.write("**sqlite3 library version**:", sqlite3.sqlite_version)  # Underlying lib version
 
-    # 版本信息不依赖客户端；纯 import 安全
+    # Version info doesn't require a client; pure imports are safe.
     try:
         import torch
         st.write("**Torch version**:", torch.__version__)
@@ -70,11 +70,11 @@ with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
     st.write("**CHROMA_PERSIST_DIR**:", persist)
     st.write("**CHROMA_COLLECTION (from env)**:", coll)
 
-    # ✅ 使用 retriever 的单例客户端做统计，避免创建第二个客户端
+    # ✅ Use retriever's singleton client for counts to avoid creating a second client.
     try:
         count = R.primary_collection_count()
         st.write("**Collection count (active)**:", count)
-        # 如需列出集合，用 list_collections_safe（不会抛异常）
+        # To list collections, use list_collections_safe (won't raise).
         cols = R.list_collections_safe()
         if cols:
             st.write("**Collections (name → count)**:",
@@ -84,12 +84,12 @@ with st.sidebar.expander("🔎 Environment Diagnostics", expanded=False):
 
 
 # =============================================================================
-# 1) Helper：Secrets 优先的 env 读取 + 友好工具
+# 1) Helper: Secrets-first env reader + friendly utilities
 # -----------------------------------------------------------------------------
 def _env(key: str, default: str | None = None) -> str | None:
     """
     Secrets-aware env reader:
-    优先 st.secrets[key]，其后 os.environ[key]，最后 default。
+    Prefer st.secrets[key], then os.environ[key], then default.
     """
     try:
         return os.getenv(key, st.secrets.get(key, default))
@@ -97,7 +97,7 @@ def _env(key: str, default: str | None = None) -> str | None:
         return os.getenv(key, default)
 
 def link_citations(md: str) -> str:
-    """把 "[#3]" / "[3]" 转为 "#hit-3" 锚点链接，便于从建议跳回证据片段。"""
+    """Convert "[#3]" / "[3]" into a "#hit-3" anchor link so advice can jump back to evidence snippets."""
     # Keep the visible text as "[n]" (not just "n") so users can see bracketed citations.
     # Use escaped brackets inside the link text to avoid Markdown parsing quirks.
     return re.sub(r"\[(?:#)?(\d+)\]", r"[\\[\1\\]](#hit-\1)", md or "")
@@ -106,8 +106,8 @@ def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
     """Split model output into (advice_md, evidence_list_md).
 
     The OpenAI prompt templates ask for two sections:
-    - "Clinical Recommendation Points" / "临床建议要点"
-    - "Evidence List" / "证据清单"
+    - "Clinical Recommendation Points"
+    - "Evidence List"
     plus a final compliance line.
 
     We render the Evidence List only in the Evidence tab (not inside Advice).
@@ -148,19 +148,22 @@ def split_advice_and_evidence_list(md: str) -> tuple[str, str]:
 
 
 def strip_redundant_advice_heading(md: str, lang: str) -> str:
-    """Remove a leading '建议：'/'Advice:' line when the UI already provides the section header."""
+    """Remove a leading "Advice:" heading line when the UI already provides the section header.
+
+    The parser supports both English and Chinese headings.
+    """
     if not md:
         return md
     heading_only = r"(?mi)^\s*(?:\*\*|__)?\s*(建议|advice)\s*(?:\*\*|__)?\s*[:：]\s*$"
     lines = md.splitlines()
-    # Case A: first line is just a heading like "建议：" / "Advice:"
+    # Case A: first line is just a heading like "Advice:".
     if lines and re.match(heading_only, lines[0] or ""):
         lines = lines[1:]
         if lines and not lines[0].strip():
             lines = lines[1:]
         return "\n".join(lines).lstrip()
 
-    # Case B: first line starts with a redundant prefix like "建议： 结论…"
+    # Case B: first line starts with a redundant prefix like "Advice: ...".
     if lines:
         m = re.match(r"(?i)^\s*(建议|advice)\s*[:：]\s*(.+)$", lines[0].strip())
         if m:
@@ -172,7 +175,7 @@ def strip_evidence_list_heading_in_advice(md: str) -> str:
     """Remove stray Evidence List headings that occasionally leak into the advice body."""
     if not md:
         return md
-    # Remove standalone header lines like "证据清单：" / "Evidence List:" (including bold wrappers)
+    # Remove standalone header lines like "Evidence List:" (including bold wrappers).
     md = re.sub(
         r"(?mi)^\s*(?:\*\*|__)?\s*(evidence\s+list|证据清单)\s*(?:\*\*|__)?\s*[:：]?\s*$\n?",
         "",
@@ -232,7 +235,7 @@ def normalize_evidence_list_md(md: str, lang: str) -> str:
     if not txt:
         return txt
 
-    # Strip any explicit header lines; the tab title already says “证据清单 / Evidence List”.
+    # Strip any explicit header lines; the tab title already says "Evidence List".
     txt = re.sub(
         r"(?mi)^\s*(?:\*\*|__)?\s*(evidence\s+list|证据清单)\s*(?:\*\*|__)?\s*[:：]?\s*$",
         "",
@@ -283,12 +286,12 @@ def evidence_list_md_from_hits(lang: str, hits: List[Dict[str, Any]]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
-    """将证据片段渲染为 Markdown（用于下载）。"""
+    """Render evidence snippets as Markdown (for download)."""
     lines = []
     for i, h in enumerate(hits or [], 1):
         m = h.get("meta") or {}
-        # title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
-        # source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
+        # title  = str(m.get("title")  or ("Untitled (zh)" if lang == "zh" else "Untitled"))
+        # source = str(m.get("source") or ("Unknown (zh)"  if lang == "zh" else "Unknown"))
         # year   = str(m.get("year")   or "—")
         title  = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
         source = (m.get("source") or m.get("source_filename") or "Unknown")
@@ -303,7 +306,7 @@ def evidence_md(lang: str, hits: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 def friendly_hints(lang: str, exc: Exception) -> List[str]:
-    """把常见后端异常翻译成友好的排障提示。"""
+    """Translate common backend exceptions into friendly troubleshooting tips."""
     msg = str(exc).lower()
     zh = (lang == "zh")
     tips = []
@@ -323,7 +326,7 @@ def friendly_hints(lang: str, exc: Exception) -> List[str]:
 
 
 # =============================================================================
-# 2) 极简 i18n（页面文案；pipeline 内部生成的文本已在后端本地化）
+# 2) Minimal i18n (page copy; text generated inside the pipeline is localized server-side)
 # -----------------------------------------------------------------------------
 I18N: Dict[str, Dict[str, str]] = {
     "zh": {
@@ -497,7 +500,7 @@ def localize_drug_record_for_ui(obj: Any, lang: str) -> Any:
 
 
 # =============================================================================
-# 3) 轻量样式
+# 3) Lightweight styles
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="CareMind · MVP CDSS", layout="wide", page_icon="💊")
 st.markdown("""
@@ -513,7 +516,7 @@ footer{visibility:hidden;}
 
 
 # =============================================================================
-# 4) 侧边栏（设置/过滤/预设/历史）
+# 4) Sidebar (settings/filters/presets/history)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     lang = st.selectbox("Language / 语言", options=["zh", "en"], index=0,
@@ -548,7 +551,7 @@ with st.sidebar:
                                  options=[preset_none] + list(presets[lang].keys()),
                                  index=0)
 
-    # 会话历史（侧边栏显示概览）
+    # Session history (sidebar overview)
     st.markdown(f"#### {t(lang, 'history_hdr')}")
     hist = st.session_state.setdefault("cm_history", [])
     if not hist:
@@ -561,7 +564,7 @@ with st.sidebar:
 
 
 # =============================================================================
-# 5) 输入表单
+# 5) Input form
 # -----------------------------------------------------------------------------
 st.title(t(lang, "title"))
 with st.form("cm_query"):
@@ -579,7 +582,7 @@ with st.form("cm_query"):
 
 
 # =============================================================================
-# 6) 页签：建议 / 证据片段 / 药品结构化 / 运行日志
+# 6) Tabs: advice / evidence / structured drug / runtime logs
 # -----------------------------------------------------------------------------
 # tab_adv, tab_hits, tab_drug, tab_log = st.tabs([
 #     t(lang, "tab_advice"),
@@ -603,7 +606,7 @@ elapsed: Optional[float] = None
 
 
 # =============================================================================
-# 7) 调用后端（反射式，兼容是否含 lang 参数）
+# 7) Call backend (reflective; compatible with optional lang parameter)
 # -----------------------------------------------------------------------------
 if submitted:
     if not (q and q.strip()):
@@ -613,7 +616,7 @@ if submitted:
             try:
                 t0 = time.time()
                 # Users sometimes paste a full template into the question box.
-                # 1) Strip explicit label lines like "药品名称：xxx".
+                # 1) Strip explicit label lines like "Drug name: ...".
                 q_clean = "\n".join(
                     [
                         ln
@@ -646,7 +649,7 @@ if submitted:
                 except Exception:
                     pass
 
-                # 记录到会话历史
+                # Append to session history.
                 st.session_state.setdefault("cm_history", []).append(
                     {"q": q.strip(), "drug": drug_effective, "k": int(k), "time": time.time()}
                 )
@@ -660,10 +663,10 @@ if submitted:
 
 
 # =============================================================================
-# 8) 渲染结果
+# 8) Render results
 # -----------------------------------------------------------------------------
 if res:
-    # --- 建议 ---
+    # --- Advice ---
     with tab_adv:
         mode = res.get("mode")
         hdr_key = "advice_hdr"
@@ -720,9 +723,9 @@ if res:
             )
         st.caption(t(lang, "disclaimer"))
       
-    # --- 证据片段 ---
+    # --- Evidence snippets ---
 
-    # --- 证据页签：只显示一次（后端整理的证据清单） ---
+    # --- Evidence tab: show once (normalized Evidence List from backend) ---
     with tab_evidence:
         hits_for_list: List[Dict[str, Any]] = res.get("guideline_hits") or []
         ev_list = evidence_list_md.strip() if evidence_list_md.strip() else evidence_list_md_from_hits(lang, hits_for_list)
@@ -759,8 +762,8 @@ if res:
 
             for i, h in enumerate(hits, 1):
                 m = h.get("meta") or {}
-                # title  = str(m.get("title")  or ("无标题" if lang == "zh" else "Untitled"))
-                # source = str(m.get("source") or ("未知"   if lang == "zh" else "Unknown"))
+                # title  = str(m.get("title")  or ("Untitled (zh)" if lang == "zh" else "Untitled"))
+                # source = str(m.get("source") or ("Unknown (zh)"  if lang == "zh" else "Unknown"))
                 # year   = str(m.get("year")   or "—")
                 title  = (m.get("title") or m.get("doc_title") or m.get("section_title") or "Untitled")
                 source = (m.get("source") or m.get("source_filename") or "Unknown")
@@ -780,7 +783,7 @@ if res:
                         )
                     st.markdown(h.get("content") or ("（空片段）" if lang == "zh" else "(empty)"))
 
-    # --- 药品结构化 ---
+    # --- Structured drug payload ---
     with tab_drug:
         st.subheader(t(lang, "drug_hdr"))
         if res.get("drug"):
@@ -788,7 +791,7 @@ if res:
         else:
             st.caption(t(lang, "no_drug"))
 
-    # --- 运行日志 ---
+    # --- Runtime logs ---
     with tab_log:
         log = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -817,27 +820,27 @@ if res:
                 st.error(f"清理失败：{e}")
 
 # =============================================================================
-# 9) 诊断面板（始终可见；统一使用 retriever 的安全接口）
+# 9) Diagnostics panel (always visible; use retriever's safe interfaces only)
 # -----------------------------------------------------------------------------
 def render_diagnostics(lang: str = "zh") -> None:
     title = t(lang, "diag_title")
     with st.expander(title, expanded=False):
-        # 有效配置（Secrets 优先）
+        # Effective config (Secrets-first)
         keys = ["CAREMIND_DEMO", "CHROMA_PERSIST_DIR", "CHROMA_COLLECTION",
                 "EMBEDDING_MODEL", "DRUG_DB_PATH"]
         eff = {k: _env(k, None) for k in keys}
         st.write(t(lang, "diag_cfg"))
         st.code(json.dumps(eff, ensure_ascii=False, indent=2))
-        # retriever 版本号（确认云端是否更新到位）
+        # Retriever version (confirm cloud deployment is updated).
         st.write("Retriever version:", getattr(R, "VERSION", "unknown"))
 
-        # Chroma 目录存在性
+        # Chroma directory existence.
         chroma_dir = eff.get("CHROMA_PERSIST_DIR") or "./chroma_store"
         abs_chroma = os.path.abspath(chroma_dir)
         st.write(f"{'Chroma 目录存在：' if lang=='zh' else 'Chroma dir exists:'} "
                  f"{abs_chroma} → {os.path.exists(abs_chroma)}")
 
-        # 集合列表（安全方式）与活动集合块数
+        # Collection list (safe) and active collection count.
         try:
             cols = R.list_collections_safe()
             st.write(t(lang, "diag_chroma"))
@@ -878,7 +881,7 @@ def render_diagnostics(lang: str = "zh") -> None:
                     msg += f"\n\nLast question: {q_last}"
                 st.warning(msg)
 
-        # SQLite 存在性与表
+        # SQLite existence and tables.
         db_path = eff.get("DRUG_DB_PATH") or "./db/drugs.sqlite"
         abs_db = os.path.abspath(db_path)
         st.write(f"{'SQLite 文件存在：' if lang=='zh' else 'SQLite file exists:'} "
@@ -894,16 +897,16 @@ def render_diagnostics(lang: str = "zh") -> None:
         except Exception as e:
             st.warning(t(lang, "diag_sqlite_err") + str(e))
 
-APPEND_DISCLAIMER = False  # 统一由 prompt 生成
+APPEND_DISCLAIMER = False  # Generated by prompt.
 
 if APPEND_DISCLAIMER:
     st.info("本工具仅供临床决策参考，不替代医师诊断与处方。")
 
-# 页面底部渲染诊断
+# Render diagnostics at the page bottom.
 render_diagnostics(lang)
 
 
 # =============================================================================
-# 10) 页脚
+# 10) Footer
 # -----------------------------------------------------------------------------
 st.caption(t(lang, "page_footer"))
