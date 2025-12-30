@@ -120,6 +120,7 @@ MIT License © 2025 Samuel Huang
 ## 📚 Documentation
 
 - Docs index: [docs/00_README.md](docs/00_README.md)
+- Technical report: [docs/technical/TECHNICAL_REPORT.md](docs/technical/TECHNICAL_REPORT.md)
 - Streamlit Cloud deployment: [docs/guides/deployment_cloud.md](docs/guides/deployment_cloud.md)
 - Testing & validation: [docs/guides/testing_validation.md](docs/guides/testing_validation.md)
 
